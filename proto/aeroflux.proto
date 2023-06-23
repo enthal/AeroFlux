@@ -1,0 +1,32 @@
+syntax = "proto3";
+package aeroflux;
+
+service Store {
+    rpc Write (WriteRequest) returns (WriteResponse);
+    //rpc Read (ReadRequest) returns (stream RecordStream);
+}
+
+message WriteRequest {
+    string topic = 1;
+    uint64 segment_index = 2;
+    repeated Record records = 3;
+}
+
+message Record {
+    Timestamp timestamp = 1;
+    bytes value = 2;
+}
+
+message WriteResponse {
+    uint32 at_offset = 1;
+    uint32 next_offset = 2;
+}
+
+// Base types
+
+message Timestamp {
+    uint64 seconds = 1;
+    uint32 nanos = 2;
+}
+
+message Empty {}
