@@ -1,3 +1,4 @@
+use prost::Message;
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
@@ -43,15 +44,23 @@ impl Store for StoreService {
         info!("");
         let req = req.get_ref();
         let root_path = format!(".data/");
+
         let topic_path = format!("{}/{}", &root_path, req.topic);
         fs::create_dir_all(&topic_path).await?;
+
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(format!("{}/{}.data", &topic_path, req.segment_index))
             .await?;
-        file.write_all(b"TODO").await?;
+        for record in &req.records {
+            let mut buf: Vec<u8> = Vec::new();
+            buf.reserve(record.encoded_len());
+            record.encode(&mut buf).unwrap();
+            file.write_all(&buf).await?;
+        }
         file.sync_all().await?;
+
         Ok(Response::new(WriteResponse {
             at_offset: 0,
             next_offset: 0,
