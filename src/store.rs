@@ -53,12 +53,12 @@ impl Store for StoreService {
             .append(true)
             .open(format!("{}/{}.data", &topic_path, req.segment_index))
             .await?;
+
+        let mut buf: Vec<u8> = Vec::new();
         for record in &req.records {
-            let mut buf: Vec<u8> = Vec::new();
-            buf.reserve(record.encoded_len());
             record.encode(&mut buf).unwrap();
-            file.write_all(&buf).await?;
         }
+        file.write_all(&buf).await?;
         file.sync_all().await?;
 
         Ok(Response::new(WriteResponse {
