@@ -1,4 +1,8 @@
-use tokio::sync::{broadcast, mpsc};
+use tokio::{
+    fs::{self, OpenOptions},
+    io::AsyncWriteExt,
+    sync::{broadcast, mpsc},
+};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::*;
@@ -10,6 +14,7 @@ use aeroflux::{
     store_server::{Store, StoreServer},
     Empty, Record, Timestamp, WriteRequest, WriteResponse,
 };
+use tracing_subscriber::fmt::format;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -33,12 +38,23 @@ pub struct StoreService {}
 
 #[tonic::async_trait]
 impl Store for StoreService {
-    #[instrument(err, skip(self, write_request), fields(req = ?write_request.get_ref()))]
-    async fn write(
-        &self,
-        write_request: Request<WriteRequest>,
-    ) -> Result<Response<WriteResponse>, Status> {
+    #[instrument(err, skip(self, req), fields(req = ?req.get_ref()))]
+    async fn write(&self, req: Request<WriteRequest>) -> Result<Response<WriteResponse>, Status> {
         info!("");
-        Err(Status::unimplemented("TODO"))
+        let req = req.get_ref();
+        let root_path = format!(".data/");
+        let topic_path = format!("{}/{}", &root_path, req.topic);
+        fs::create_dir_all(&topic_path).await?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{}/{}.data", &topic_path, req.segment_index))
+            .await?;
+        file.write_all(b"TODO").await?;
+        file.sync_all().await?;
+        Ok(Response::new(WriteResponse {
+            at_offset: 0,
+            next_offset: 0,
+        }))
     }
 }
