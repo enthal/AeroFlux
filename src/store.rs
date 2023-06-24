@@ -1,3 +1,5 @@
+use std::mem::size_of;
+
 use prost::Message;
 use tokio::{
     fs::{self, OpenOptions},
@@ -48,25 +50,42 @@ impl Store for StoreService {
         let topic_path = format!("{}/{}", &root_path, req.topic);
         fs::create_dir_all(&topic_path).await?;
 
-        let mut file = OpenOptions::new()
+        let mut records_file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(format!("{}/{}.data", &topic_path, req.segment_index))
+            .open(format!("{}/{}.records", &topic_path, req.segment_index))
+            .await?;
+        let mut index_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{}/{}.index", &topic_path, req.segment_index))
             .await?;
 
-        let len = file.metadata().await?.len();
+        // TODO: u32::MAX is probably the wrong max records file length!  u64.
+        // records_file must not be longer than u32::MAX; TODO: else error (the file is corrupt)
+        let records_start_pos = records_file.metadata().await?.len() as u32;
+        // records_file must have fewer than u32::MAX records; TODO: else error (the file is corrupt)
+        let records_start_count =
+            index_file.metadata().await?.len() as u32 / size_of::<u32>() as u32;
+        // TODO: reject (segment must be closed):
+        //   if records_start_count as u64 + req.records.len() > u32::MAX
 
-        let mut buf: Vec<u8> = Vec::new();
+        let mut records_buf: Vec<u8> = Vec::new();
+        let mut index_buf: Vec<u8> = Vec::new();
         for record in &req.records {
-            record.encode(&mut buf).unwrap();
+            let pos = records_buf.len() as u32;
+            record.encode(&mut records_buf).unwrap();
+            index_buf.extend_from_slice(&(records_start_pos + pos).to_ne_bytes());
         }
-        // TODO: reject if len+buf.len() ? u32::MAX
-        file.write_all(&buf).await?;
-        file.sync_all().await?;
+        // TODO: reject (segment must be closed) if records_start_pos+records_buf.len() > u32::MAX
+        records_file.write_all(&records_buf).await?;
+        index_file.write_all(&index_buf).await?;
+        records_file.sync_all().await?;
+        index_file.sync_all().await?;
 
         Ok(Response::new(WriteResponse {
-            at_offset: len as u32,
-            next_offset: len as u32 + buf.len() as u32,
+            at_offset: records_start_count,
+            next_offset: records_start_count + req.records.len() as u32,
         }))
     }
 }
