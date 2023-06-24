@@ -54,16 +54,19 @@ impl Store for StoreService {
             .open(format!("{}/{}.data", &topic_path, req.segment_index))
             .await?;
 
+        let len = file.metadata().await?.len();
+
         let mut buf: Vec<u8> = Vec::new();
         for record in &req.records {
             record.encode(&mut buf).unwrap();
         }
+        // TODO: reject if len+buf.len() ? u32::MAX
         file.write_all(&buf).await?;
         file.sync_all().await?;
 
         Ok(Response::new(WriteResponse {
-            at_offset: 0,
-            next_offset: 0,
+            at_offset: len as u32,
+            next_offset: len as u32 + buf.len() as u32,
         }))
     }
 }
