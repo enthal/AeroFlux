@@ -3,7 +3,7 @@ package aeroflux;
 
 service Store {
     rpc Write (WriteRequest) returns (WriteResponse);
-    //rpc Read (ReadRequest) returns (stream RecordStream);
+    rpc Read (ReadRequest) returns (stream ReadResponse);
 }
 
 message WriteRequest {
@@ -20,6 +20,26 @@ message Record {
 message WriteResponse {
     uint32 at_offset = 1;
     uint32 next_offset = 2;
+}
+
+message ReadRequest {
+    string topic = 1;
+    uint64 segment_index = 2;
+    uint32 from_offset = 3;
+}
+
+message ReadResponse {
+    oneof event {
+        Record record = 1;
+        Empty close = 2;
+        ErrorCode error = 3;
+    }
+}
+
+enum ErrorCode {
+    ERROR_UNSPECIFIED = 0;
+    ERROR_NO_SUCH_SEGMENT = 1;
+    ERROR_NO_SUCH_OFFSET_IN_SEGMENT = 2;
 }
 
 // Base types

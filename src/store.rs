@@ -15,7 +15,7 @@ pub mod aeroflux {
 }
 use aeroflux::{
     store_server::{Store, StoreServer},
-    Empty, Record, Timestamp, WriteRequest, WriteResponse,
+    Empty, ReadRequest, ReadResponse, Record, Timestamp, WriteRequest, WriteResponse,
 };
 use tracing_subscriber::fmt::format;
 
@@ -43,27 +43,31 @@ pub struct StoreService {}
 impl Store for StoreService {
     #[instrument(err, skip(self, req), fields(req = ?req.get_ref()))]
     async fn write(&self, req: Request<WriteRequest>) -> Result<Response<WriteResponse>, Status> {
-        info!("");
+        info!("start");
         let req = req.get_ref();
-        let root_path = format!(".data/");
 
-        let topic_path = format!("{}/{}", &root_path, req.topic);
-        fs::create_dir_all(&topic_path).await?;
+        let pathing = Pathing {
+            topic: req.topic.clone(),
+            segment_index: req.segment_index,
+        };
+
+        fs::create_dir_all(pathing.topic_dir_path()).await?;
 
         let mut records_file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(format!("{}/{}.records", &topic_path, req.segment_index))
+            .open(pathing.records_file_path())
             .await?;
         let mut index_file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(format!("{}/{}.index", &topic_path, req.segment_index))
+            .open(pathing.index_file_path())
             .await?;
 
         // TODO: u32::MAX is probably the wrong max records file length!  u64.
         // records_file must not be longer than u32::MAX; TODO: else error (the file is corrupt)
-        let records_start_pos = records_file.metadata().await?.len() as u32;
+        let records_start_pos = //.
+            records_file.metadata().await?.len() as u32;
         // records_file must have fewer than u32::MAX records; TODO: else error (the file is corrupt)
         let records_start_count =
             index_file.metadata().await?.len() as u32 / size_of::<u32>() as u32;
@@ -87,5 +91,34 @@ impl Store for StoreService {
             at_offset: records_start_count,
             next_offset: records_start_count + req.records.len() as u32,
         }))
+    }
+
+    type ReadStream = ReceiverStream<Result<ReadResponse, Status>>;
+
+    #[instrument(err, skip(self, req), fields(req = ?req.get_ref()))]
+    async fn read(&self, req: Request<ReadRequest>) -> Result<Response<Self::ReadStream>, Status> {
+        info!("start");
+        let (stream_tx, stream_rx) = mpsc::channel(16); // TODO: tunable?
+
+        Ok(Response::new(ReceiverStream::new(stream_rx)))
+    }
+}
+
+#[derive(Debug)]
+pub struct Pathing {
+    topic: String,
+    segment_index: u64,
+}
+impl Pathing {
+    const ROOT_PATH: &str = ".data/";
+
+    fn topic_dir_path(&self) -> String {
+        format!("{}/{}", Pathing::ROOT_PATH, self.topic)
+    }
+    fn records_file_path(&self) -> String {
+        format!("{}/{}.records", self.topic_dir_path(), self.segment_index)
+    }
+    fn index_file_path(&self) -> String {
+        format!("{}/{}.index", self.topic_dir_path(), self.segment_index)
     }
 }
