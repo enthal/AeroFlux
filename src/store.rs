@@ -14,6 +14,7 @@ pub mod aeroflux {
     tonic::include_proto!("aeroflux");
 }
 use aeroflux::{
+    read_response::Event,
     store_server::{Store, StoreServer},
     Empty, ReadRequest, ReadResponse, Record, Timestamp, WriteRequest, WriteResponse,
 };
@@ -77,7 +78,7 @@ impl Store for StoreService {
         let mut index_buf: Vec<u8> = Vec::new();
         for record in &req.records {
             let pos = records_buf.len() as u32;
-            record.encode_length_delimited(&mut records_buf).unwrap();
+            record.encode_length_delimited(&mut records_buf).unwrap(); // TODO: no unwrap
             index_buf.extend_from_slice(&(records_start_pos + pos).to_le_bytes());
         }
         // TODO: reject (segment must be closed) if records_start_pos+records_buf.len() > u32::MAX
@@ -135,7 +136,25 @@ impl Store for StoreService {
 
         let (stream_tx, stream_rx) = mpsc::channel(16); // TODO: tunable?
 
-        // TODO: Now what?  Record::decode(buf);
+        // Frame: Decode variable-length record length_delimiter.
+        // TODO: consider using fixed-length (4 byte?) record length_delimiter.
+        let mut length_delimiter_buf = [0; 10]; // decode_length_delimiter needs exactly 10
+        records_file.read_exact(&mut length_delimiter_buf).await?;
+        let record_length = prost::decode_length_delimiter(&length_delimiter_buf[..]).unwrap(); // TODO: no unwrap
+        let record_start_pos = from_pos as u64 + prost::length_delimiter_len(record_length) as u64;
+        records_file.seek(SeekFrom::Start(record_start_pos)).await?;
+
+        // Read and send record
+        let mut record_buf = vec![0u8; record_length];
+        records_file.read_exact(&mut record_buf).await?;
+        let record_buf = prost::bytes::Bytes::from(record_buf);
+        let record = Record::decode(record_buf).unwrap(); // TODO: no unwrap
+        stream_tx
+            .send(Ok(ReadResponse {
+                event: Some(Event::Record(record)),
+            }))
+            .await
+            .unwrap(); // TODO: no unwrap
 
         Ok(Response::new(ReceiverStream::new(stream_rx)))
     }
