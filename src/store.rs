@@ -128,17 +128,16 @@ impl Store for StoreService {
             ))
             .await?; // TODO: convert error
         let mut from_pos = index_file.read_u32_le().await? as u64; // little-endian
-        info!(
-            "Read: from_offset:{} from_pos:{}",
-            req.from_offset, from_pos
-        );
+        info!("from_pos:{}", from_pos);
         records_file.seek(SeekFrom::Start(from_pos)).await?;
 
         let (stream_tx, stream_rx) = mpsc::channel(16); // TODO: tunable?
 
+        // Read and send every record from_offset through last
         let from_offset = req.from_offset;
         tokio::spawn(
             async move {
+                info!("start");
                 for _ in from_offset..record_count {
                     // Frame: Decode variable-length record length_delimiter.
                     // TODO: consider using fixed-length (4 byte?) record length_delimiter.
@@ -169,7 +168,15 @@ impl Store for StoreService {
                         .unwrap(); // TODO: no unwrap
                     from_pos = record_start_pos + record_length as u64;
                 }
-                info!("done"); // channel closed
+
+                // Send end
+                stream_tx
+                    .send(Ok(ReadResponse {
+                        event: Some(Event::End(Empty {})),
+                    }))
+                    .await
+                    .unwrap(); // TODO: no unwrap
+                info!("done");
             }
             .instrument(info_span!("loop")),
         );

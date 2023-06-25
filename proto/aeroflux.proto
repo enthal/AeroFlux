@@ -31,8 +31,9 @@ message ReadRequest {
 message ReadResponse {
     oneof event {
         Record record = 1;
-        Empty close = 2;
-        ErrorCode error = 3;
+        Empty end = 2;
+        Empty close = 3;
+        ErrorCode error = 4;
     }
 }
 
