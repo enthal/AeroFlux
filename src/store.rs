@@ -136,10 +136,10 @@ impl Store for StoreService {
 
         let (stream_tx, stream_rx) = mpsc::channel(16); // TODO: tunable?
 
-        let mut offset = req.from_offset;
+        let from_offset = req.from_offset;
         tokio::spawn(
             async move {
-                loop {
+                for _ in from_offset..record_count {
                     // Frame: Decode variable-length record length_delimiter.
                     // TODO: consider using fixed-length (4 byte?) record length_delimiter.
                     let mut length_delimiter_buf = [0; 10]; // decode_length_delimiter needs exactly 10
@@ -168,11 +168,6 @@ impl Store for StoreService {
                         .await
                         .unwrap(); // TODO: no unwrap
                     from_pos = record_start_pos + record_length as u64;
-
-                    offset += 1;
-                    if offset >= record_count {
-                        break;
-                    }
                 }
                 info!("done"); // channel closed
             }
