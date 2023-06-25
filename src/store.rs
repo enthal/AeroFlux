@@ -127,34 +127,57 @@ impl Store for StoreService {
                 req.from_offset as u64 * size_of::<u32>() as u64,
             ))
             .await?; // TODO: convert error
-        let from_pos = index_file.read_u32_le().await?; // little-endian
+        let mut from_pos = index_file.read_u32_le().await? as u64; // little-endian
         info!(
             "Read: from_offset:{} from_pos:{}",
             req.from_offset, from_pos
         );
-        records_file.seek(SeekFrom::Start(from_pos as u64)).await?;
+        records_file.seek(SeekFrom::Start(from_pos)).await?;
 
         let (stream_tx, stream_rx) = mpsc::channel(16); // TODO: tunable?
 
-        // Frame: Decode variable-length record length_delimiter.
-        // TODO: consider using fixed-length (4 byte?) record length_delimiter.
-        let mut length_delimiter_buf = [0; 10]; // decode_length_delimiter needs exactly 10
-        records_file.read_exact(&mut length_delimiter_buf).await?;
-        let record_length = prost::decode_length_delimiter(&length_delimiter_buf[..]).unwrap(); // TODO: no unwrap
-        let record_start_pos = from_pos as u64 + prost::length_delimiter_len(record_length) as u64;
-        records_file.seek(SeekFrom::Start(record_start_pos)).await?;
+        let mut offset = req.from_offset;
+        tokio::spawn(
+            async move {
+                loop {
+                    // Frame: Decode variable-length record length_delimiter.
+                    // TODO: consider using fixed-length (4 byte?) record length_delimiter.
+                    let mut length_delimiter_buf = [0; 10]; // decode_length_delimiter needs exactly 10
+                    records_file
+                        .read_exact(&mut length_delimiter_buf)
+                        .await
+                        .unwrap(); // TODO: no unwrap
+                    let record_length =
+                        prost::decode_length_delimiter(&length_delimiter_buf[..]).unwrap(); // TODO: no unwrap
+                    let record_start_pos =
+                        from_pos as u64 + prost::length_delimiter_len(record_length) as u64;
+                    records_file
+                        .seek(SeekFrom::Start(record_start_pos))
+                        .await
+                        .unwrap(); // TODO: no unwrap
 
-        // Read and send record
-        let mut record_buf = vec![0u8; record_length];
-        records_file.read_exact(&mut record_buf).await?;
-        let record_buf = prost::bytes::Bytes::from(record_buf);
-        let record = Record::decode(record_buf).unwrap(); // TODO: no unwrap
-        stream_tx
-            .send(Ok(ReadResponse {
-                event: Some(Event::Record(record)),
-            }))
-            .await
-            .unwrap(); // TODO: no unwrap
+                    // Read and send record
+                    let mut record_buf = vec![0u8; record_length];
+                    records_file.read_exact(&mut record_buf).await.unwrap(); // TODO: no unwrap
+                    let record_buf = prost::bytes::Bytes::from(record_buf);
+                    let record = Record::decode(record_buf).unwrap(); // TODO: no unwrap
+                    stream_tx
+                        .send(Ok(ReadResponse {
+                            event: Some(Event::Record(record)),
+                        }))
+                        .await
+                        .unwrap(); // TODO: no unwrap
+                    from_pos = record_start_pos + record_length as u64;
+
+                    offset += 1;
+                    if offset >= record_count {
+                        break;
+                    }
+                }
+                info!("done"); // channel closed
+            }
+            .instrument(info_span!("loop")),
+        );
 
         Ok(Response::new(ReceiverStream::new(stream_rx)))
     }
