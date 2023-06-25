@@ -1,9 +1,9 @@
-use std::mem::size_of;
+use std::{io::SeekFrom, mem::size_of};
 
 use prost::Message;
 use tokio::{
     fs::{self, OpenOptions},
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::{broadcast, mpsc},
 };
 use tokio_stream::wrappers::ReceiverStream;
@@ -45,7 +45,6 @@ impl Store for StoreService {
     async fn write(&self, req: Request<WriteRequest>) -> Result<Response<WriteResponse>, Status> {
         info!("start");
         let req = req.get_ref();
-
         let pathing = Pathing {
             topic: req.topic.clone(),
             segment_index: req.segment_index,
@@ -78,8 +77,8 @@ impl Store for StoreService {
         let mut index_buf: Vec<u8> = Vec::new();
         for record in &req.records {
             let pos = records_buf.len() as u32;
-            record.encode(&mut records_buf).unwrap();
-            index_buf.extend_from_slice(&(records_start_pos + pos).to_ne_bytes());
+            record.encode_length_delimited(&mut records_buf).unwrap();
+            index_buf.extend_from_slice(&(records_start_pos + pos).to_le_bytes());
         }
         // TODO: reject (segment must be closed) if records_start_pos+records_buf.len() > u32::MAX
         records_file.write_all(&records_buf).await?;
@@ -98,7 +97,45 @@ impl Store for StoreService {
     #[instrument(err, skip(self, req), fields(req = ?req.get_ref()))]
     async fn read(&self, req: Request<ReadRequest>) -> Result<Response<Self::ReadStream>, Status> {
         info!("start");
+        let req = req.get_ref();
+        let pathing = Pathing {
+            topic: req.topic.clone(),
+            segment_index: req.segment_index,
+        };
+
+        let mut records_file = OpenOptions::new()
+            .read(true)
+            .open(pathing.records_file_path())
+            .await?; // TODO: convert error
+        let mut index_file = OpenOptions::new()
+            .read(true)
+            .open(pathing.index_file_path())
+            .await?;
+
+        // Seek records_file to pos from index_file at offset
+        let record_count =
+            index_file.seek(SeekFrom::End(0)).await? as u32 / size_of::<u32>() as u32;
+        if req.from_offset > record_count {
+            return Err(Status::out_of_range(format!(
+                "No such offset ({}) in segment ({} records)",
+                req.from_offset, record_count
+            )));
+        }
+        index_file
+            .seek(SeekFrom::Start(
+                req.from_offset as u64 * size_of::<u32>() as u64,
+            ))
+            .await?; // TODO: convert error
+        let from_pos = index_file.read_u32_le().await?; // little-endian
+        info!(
+            "Read: from_offset:{} from_pos:{}",
+            req.from_offset, from_pos
+        );
+        records_file.seek(SeekFrom::Start(from_pos as u64)).await?;
+
         let (stream_tx, stream_rx) = mpsc::channel(16); // TODO: tunable?
+
+        // TODO: Now what?  Record::decode(buf);
 
         Ok(Response::new(ReceiverStream::new(stream_rx)))
     }
