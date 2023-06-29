@@ -1,10 +1,13 @@
-use std::{io::SeekFrom, mem::size_of};
+use std::{io::SeekFrom, mem::size_of, ops::Range};
 
 use prost::Message;
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    sync::{broadcast, mpsc},
+    sync::{
+        broadcast,
+        mpsc::{self, Sender},
+    },
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request, Response, Status};
@@ -18,7 +21,6 @@ use aeroflux::{
     store_server::{Store, StoreServer},
     Empty, ReadRequest, ReadResponse, Record, Timestamp, WriteRequest, WriteResponse,
 };
-use tracing_subscriber::fmt::format;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -104,16 +106,11 @@ impl Store for StoreService {
             segment_index: req.segment_index,
         };
 
-        let mut records_file = OpenOptions::new()
-            .read(true)
-            .open(pathing.records_file_path())
-            .await?; // TODO: convert error
+        // Find from_pos (in records_file) per index_file at offset
         let mut index_file = OpenOptions::new()
             .read(true)
             .open(pathing.index_file_path())
             .await?;
-
-        // Seek records_file to pos from index_file at offset
         let record_count =
             index_file.seek(SeekFrom::End(0)).await? as u32 / size_of::<u32>() as u32;
         if req.from_offset > record_count {
@@ -127,63 +124,73 @@ impl Store for StoreService {
                 req.from_offset as u64 * size_of::<u32>() as u64,
             ))
             .await?; // TODO: convert error
-        let mut from_pos = index_file.read_u32_le().await? as u64; // little-endian
+        let from_pos = index_file.read_u32_le().await? as u64; // little-endian
         info!("from_pos:{}", from_pos);
-        records_file.seek(SeekFrom::Start(from_pos)).await?;
 
         let (stream_tx, stream_rx) = mpsc::channel(16); // TODO: tunable?
 
-        // Read and send every record from_offset through last
-        let from_offset = req.from_offset;
-        tokio::spawn(
-            async move {
-                info!("start");
-                for _ in from_offset..record_count {
-                    // Frame: Decode variable-length record length_delimiter.
-                    // TODO: consider using fixed-length (4 byte?) record length_delimiter.
-                    let mut length_delimiter_buf = [0; 10]; // decode_length_delimiter needs exactly 10
-                    records_file
-                        .read_exact(&mut length_delimiter_buf)
-                        .await
-                        .unwrap(); // TODO: no unwrap
-                    let record_length =
-                        prost::decode_length_delimiter(&length_delimiter_buf[..]).unwrap(); // TODO: no unwrap
-                    let record_start_pos =
-                        from_pos as u64 + prost::length_delimiter_len(record_length) as u64;
-                    records_file
-                        .seek(SeekFrom::Start(record_start_pos))
-                        .await
-                        .unwrap(); // TODO: no unwrap
-
-                    // Read and send record
-                    let mut record_buf = vec![0u8; record_length];
-                    records_file.read_exact(&mut record_buf).await.unwrap(); // TODO: no unwrap
-                    let record_buf = prost::bytes::Bytes::from(record_buf);
-                    let record = Record::decode(record_buf).unwrap(); // TODO: no unwrap
-                    stream_tx
-                        .send(Ok(ReadResponse {
-                            event: Some(Event::Record(record)),
-                        }))
-                        .await
-                        .unwrap(); // TODO: no unwrap
-                    from_pos = record_start_pos + record_length as u64;
-                }
-
-                // Send end
-                stream_tx
-                    .send(Ok(ReadResponse {
-                        event: Some(Event::End(Empty {})),
-                    }))
-                    .await
-                    .unwrap(); // TODO: no unwrap
-                info!("done");
-            }
-            .instrument(info_span!("loop")),
-        );
+        // Read and send every record in record_range
+        let record_range = req.from_offset..record_count;
+        let mut records_file = OpenOptions::new()
+            .read(true)
+            .open(pathing.records_file_path())
+            .await?; // TODO: convert error
+        tokio::spawn(async move {
+            Self::read_and_send(record_range, records_file, from_pos, stream_tx)
+                .await
+                .expect("Reading and sending should work")
+            // TODO: log on send error; send an error on file io error
+        });
 
         Ok(Response::new(ReceiverStream::new(stream_rx)))
     }
 }
+
+impl StoreService {
+    #[instrument(err, skip(), fields())]
+    async fn read_and_send(
+        record_range: Range<u32>,
+        mut records_file: fs::File,
+        mut file_pos: u64,
+        stream_tx: Sender<Result<ReadResponse, Status>>,
+    ) -> Result<(), Error> {
+        info!("start");
+        records_file.seek(SeekFrom::Start(file_pos)).await?;
+        for _ in record_range {
+            // Frame: Decode variable-length record length_delimiter.
+            // TODO: consider using fixed-length (4 byte?) record length_delimiter.
+            let mut length_delimiter_buf = [0; 10]; // decode_length_delimiter needs exactly 10
+            records_file.read_exact(&mut length_delimiter_buf).await?;
+            let record_length = prost::decode_length_delimiter(&length_delimiter_buf[..])?;
+            let record_start_pos =
+                file_pos as u64 + prost::length_delimiter_len(record_length) as u64;
+            records_file.seek(SeekFrom::Start(record_start_pos)).await?;
+
+            // Read and send record
+            let mut record_buf = vec![0u8; record_length];
+            records_file.read_exact(&mut record_buf).await?;
+            let record_buf = prost::bytes::Bytes::from(record_buf);
+            let record = Record::decode(record_buf)?;
+            stream_tx
+                .send(Ok(ReadResponse {
+                    event: Some(Event::Record(record)),
+                }))
+                .await?;
+
+            file_pos = record_start_pos + record_length as u64;
+        }
+
+        // Send end
+        stream_tx
+            .send(Ok(ReadResponse {
+                event: Some(Event::End(Empty {})),
+            }))
+            .await?;
+        info!("done");
+        Ok(())
+    }
+}
+impl StoreService {}
 
 #[derive(Debug)]
 pub struct Pathing {
