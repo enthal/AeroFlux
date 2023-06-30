@@ -135,19 +135,22 @@ impl Store for StoreService {
             .read(true)
             .open(pathing.records_file_path())
             .await?; // TODO: convert error
-        tokio::spawn(async move {
-            Self::read_and_send(record_range, records_file, from_pos, stream_tx)
-                .await
-                .expect("Reading and sending should work")
-            // TODO: log on send error; send an error on file io error
-        });
+        tokio::spawn(
+            async move {
+                Self::read_and_send(record_range, records_file, from_pos, stream_tx)
+                    .await
+                    .expect("Reading and sending should work")
+                // TODO: log on send error; send an error on file io error
+            }
+            .instrument(info_span!("")),
+        );
 
         Ok(Response::new(ReceiverStream::new(stream_rx)))
     }
 }
 
 impl StoreService {
-    #[instrument(err, skip(), fields())]
+    #[instrument(err, skip(records_file, stream_tx), fields())]
     async fn read_and_send(
         record_range: Range<u32>,
         mut records_file: fs::File,
