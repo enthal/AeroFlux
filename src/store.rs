@@ -4,10 +4,7 @@ use prost::{DecodeError, Message};
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    sync::{
-        broadcast,
-        mpsc::{self, Sender},
-    },
+    sync::mpsc::{self, Sender},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request, Response, Status};
@@ -19,7 +16,7 @@ pub mod aeroflux {
 use aeroflux::{
     read_response::Event,
     store_server::{Store, StoreServer},
-    Empty, ErrorCode, ReadRequest, ReadResponse, Record, Timestamp, WriteRequest, WriteResponse,
+    Empty, ErrorCode, ReadRequest, ReadResponse, Record, WriteRequest, WriteResponse,
 };
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
