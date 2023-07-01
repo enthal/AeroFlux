@@ -136,25 +136,24 @@ impl Store for StoreService {
             .await?; // TODO: convert error
         tokio::spawn(
             async move {
+                let terminate = |event: Event| async {
+                    stream_tx
+                        .send(Ok(ReadResponse { event: Some(event) }))
+                        .await
+                        .ok(); // best effort
+                };
                 match Self::read_and_send(record_range, records_file, from_pos, &stream_tx).await {
                     Ok(_) => {
-                        Self::send_terminal_read_response(stream_tx, Event::End(Empty {})).await;
+                        terminate(Event::End(Empty {})).await;
                     }
                     Err(err) => {
-                        if let Some(_) = err.downcast_ref::<Status>() {
-                            // Send error.  Don't try to send again.
+                        if false {
+                        } else if let Some(_) = err.downcast_ref::<Status>() {
+                            // Error on send.  Don't try to send again.
                         } else if let Some(_) = err.downcast_ref::<DecodeError>() {
-                            Self::send_terminal_read_response(
-                                stream_tx,
-                                Event::Error(ErrorCode::ProtobufError as i32),
-                            )
-                            .await;
+                            terminate(Event::Error(ErrorCode::ProtobufError as i32)).await;
                         } else if let Some(_) = err.downcast_ref::<std::io::Error>() {
-                            Self::send_terminal_read_response(
-                                stream_tx,
-                                Event::Error(ErrorCode::IoError as i32),
-                            )
-                            .await;
+                            terminate(Event::Error(ErrorCode::IoError as i32)).await;
                         } else {
                             error!("Unknown Error: {}", err);
                         }
@@ -206,16 +205,6 @@ impl StoreService {
 
         info!("end");
         Ok(())
-    }
-
-    async fn send_terminal_read_response(
-        stream_tx: Sender<Result<ReadResponse, Status>>,
-        event: Event,
-    ) {
-        stream_tx
-            .send(Ok(ReadResponse { event: Some(event) }))
-            .await
-            .ok(); // best effort
     }
 }
 
