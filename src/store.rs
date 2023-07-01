@@ -1,6 +1,6 @@
 use std::{io::SeekFrom, mem::size_of, ops::Range};
 
-use prost::Message;
+use prost::{DecodeError, Message};
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
@@ -99,7 +99,6 @@ impl Store for StoreService {
 
     #[instrument(err, skip(self, req), fields(req = ?req.get_ref()))]
     async fn read(&self, req: Request<ReadRequest>) -> Result<Response<Self::ReadStream>, Status> {
-        info!("start");
         let req = req.get_ref();
         let pathing = Pathing {
             topic: req.topic.clone(),
@@ -137,35 +136,39 @@ impl Store for StoreService {
             .await?; // TODO: convert error
         tokio::spawn(
             async move {
-                Self::read_and_send(record_range, records_file, from_pos, &stream_tx)
-                    .await
-                    .or_else(|err| {
+                match Self::read_and_send(record_range, records_file, from_pos, &stream_tx).await {
+                    Ok(_) => {
+                        stream_tx
+                            .send(Ok(ReadResponse {
+                                event: Some(Event::End(Empty {})),
+                            }))
+                            .await
+                            .ok(); // best effort
+                    }
+                    Err(err) => {
                         if let Some(status) = err.downcast_ref::<Status>() {
                             warn!("Error sending: {}", status);
-                            Ok(())
+                        } else if let Some(decode_err) = err.downcast_ref::<DecodeError>() {
+                            error!("DecodeError: {}", decode_err);
+                            stream_tx
+                                .send(Ok(ReadResponse {
+                                    event: Some(Event::Error(ErrorCode::ProtobufError as i32)),
+                                }))
+                                .await
+                                .ok(); // best effort
                         } else if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
                             error!("IO Error: {}", io_err);
                             stream_tx
                                 .send(Ok(ReadResponse {
                                     event: Some(Event::Error(ErrorCode::IoError as i32)),
                                 }))
-                                .await;
-                            Ok(())
+                                .await
+                                .ok(); // best effort
                         } else {
                             error!("Unknown Error: {}", err);
-                            Ok(())
                         }
-                    })
-                    .expect("Reading and sending should work");
-
-                // Send end
-                stream_tx
-                    .send(Ok(ReadResponse {
-                        event: Some(Event::End(Empty {})),
-                    }))
-                    .await
-                    .unwrap();
-                info!("done");
+                    }
+                }
             }
             .instrument(info_span!("")),
         );
@@ -183,6 +186,7 @@ impl StoreService {
         stream_tx: &Sender<Result<ReadResponse, Status>>,
     ) -> Result<(), Error> {
         info!("start");
+
         records_file.seek(SeekFrom::Start(file_pos)).await?;
         for _ in record_range {
             // Frame: Decode variable-length record length_delimiter.
@@ -208,6 +212,7 @@ impl StoreService {
             file_pos = record_start_pos + record_length as u64;
         }
 
+        info!("end");
         Ok(())
     }
 }
