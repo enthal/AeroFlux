@@ -123,7 +123,7 @@ impl Store for StoreService {
         let from_pos = index_file.read_u32_le().await? as u64; // little-endian
         info!("from_pos:{}", from_pos);
 
-        let (stream_tx, stream_rx) = mpsc::channel(16); // TODO: tunable?
+        let (tx, rx) = mpsc::channel(16); // TODO: tunable?
 
         // Read and send every record in record_range
         let record_range = req.from_offset..record_count;
@@ -134,12 +134,10 @@ impl Store for StoreService {
         tokio::spawn(
             async move {
                 let terminate = |event: Event| async {
-                    stream_tx
-                        .send(Ok(ReadResponse { event: Some(event) }))
-                        .await
-                        .ok(); // best effort
+                    tx.send(Ok(ReadResponse { event: Some(event) })).await.ok();
+                    // best effort
                 };
-                match Self::read_and_send(record_range, records_file, from_pos, &stream_tx).await {
+                match Self::read_and_send(record_range, records_file, from_pos, &tx).await {
                     Ok(_) => {
                         terminate(Event::End(Empty {})).await;
                     }
@@ -160,7 +158,7 @@ impl Store for StoreService {
             .instrument(info_span!("")),
         );
 
-        Ok(Response::new(ReceiverStream::new(stream_rx)))
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 
