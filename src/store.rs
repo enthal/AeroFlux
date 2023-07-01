@@ -146,18 +146,16 @@ impl Store for StoreService {
                             .ok(); // best effort
                     }
                     Err(err) => {
-                        if let Some(status) = err.downcast_ref::<Status>() {
-                            warn!("Error sending: {}", status);
-                        } else if let Some(decode_err) = err.downcast_ref::<DecodeError>() {
-                            error!("DecodeError: {}", decode_err);
+                        if let Some(_) = err.downcast_ref::<Status>() {
+                            // Send error.  Don't try to send again.
+                        } else if let Some(_) = err.downcast_ref::<DecodeError>() {
                             stream_tx
                                 .send(Ok(ReadResponse {
                                     event: Some(Event::Error(ErrorCode::ProtobufError as i32)),
                                 }))
                                 .await
                                 .ok(); // best effort
-                        } else if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
-                            error!("IO Error: {}", io_err);
+                        } else if let Some(_) = err.downcast_ref::<std::io::Error>() {
                             stream_tx
                                 .send(Ok(ReadResponse {
                                     event: Some(Event::Error(ErrorCode::IoError as i32)),
@@ -186,6 +184,7 @@ impl StoreService {
         stream_tx: &Sender<Result<ReadResponse, Status>>,
     ) -> Result<(), Error> {
         info!("start");
+        //file_pos += 300;
 
         records_file.seek(SeekFrom::Start(file_pos)).await?;
         for _ in record_range {
