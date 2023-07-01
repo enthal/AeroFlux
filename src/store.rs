@@ -138,30 +138,23 @@ impl Store for StoreService {
             async move {
                 match Self::read_and_send(record_range, records_file, from_pos, &stream_tx).await {
                     Ok(_) => {
-                        stream_tx
-                            .send(Ok(ReadResponse {
-                                event: Some(Event::End(Empty {})),
-                            }))
-                            .await
-                            .ok(); // best effort
+                        Self::send_terminal_read_response(stream_tx, Event::End(Empty {})).await;
                     }
                     Err(err) => {
                         if let Some(_) = err.downcast_ref::<Status>() {
                             // Send error.  Don't try to send again.
                         } else if let Some(_) = err.downcast_ref::<DecodeError>() {
-                            stream_tx
-                                .send(Ok(ReadResponse {
-                                    event: Some(Event::Error(ErrorCode::ProtobufError as i32)),
-                                }))
-                                .await
-                                .ok(); // best effort
+                            Self::send_terminal_read_response(
+                                stream_tx,
+                                Event::Error(ErrorCode::ProtobufError as i32),
+                            )
+                            .await;
                         } else if let Some(_) = err.downcast_ref::<std::io::Error>() {
-                            stream_tx
-                                .send(Ok(ReadResponse {
-                                    event: Some(Event::Error(ErrorCode::IoError as i32)),
-                                }))
-                                .await
-                                .ok(); // best effort
+                            Self::send_terminal_read_response(
+                                stream_tx,
+                                Event::Error(ErrorCode::IoError as i32),
+                            )
+                            .await;
                         } else {
                             error!("Unknown Error: {}", err);
                         }
@@ -214,8 +207,17 @@ impl StoreService {
         info!("end");
         Ok(())
     }
+
+    async fn send_terminal_read_response(
+        stream_tx: Sender<Result<ReadResponse, Status>>,
+        event: Event,
+    ) {
+        stream_tx
+            .send(Ok(ReadResponse { event: Some(event) }))
+            .await
+            .ok(); // best effort
+    }
 }
-impl StoreService {}
 
 #[derive(Debug)]
 pub struct Pathing {
