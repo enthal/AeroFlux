@@ -63,32 +63,49 @@ impl Store for StoreService {
             .open(pathing.index_file_path())
             .await?;
 
-        // TODO: u32::MAX is probably the wrong max records file length!  u64.
-        // records_file must not be longer than u32::MAX; TODO: else error (the file is corrupt)
-        let records_start_pos = //.
-            records_file.metadata().await?.len() as u32;
+        // Note: pos means byte index in records_file; offset means record offset in segment.
+
+        // records_file must not be longer than u32::MAX, since its length must fit in a 4-byte index file entry.
+        let records_start_pos = async {
+            let len = records_file.metadata().await?.len();
+            if len > u32::MAX as u64 {
+                Err(Status::data_loss("records_file is too large"))
+            } else {
+                Ok(len as u32)
+            }
+        }
+        .await?;
+
         // records_file must have fewer than u32::MAX records; TODO: else error (the file is corrupt)
-        let records_start_count =
+        let first_record_offset =
             index_file.metadata().await?.len() as u32 / size_of::<u32>() as u32;
-        // TODO: reject (segment must be closed):
-        //   if records_start_count as u64 + req.records.len() > u32::MAX
+        if (first_record_offset as u64) + (req.records.len() as u64) > (u32::MAX as u64) {
+            // TODO: store fact that segment is closed.
+            return Err(Status::out_of_range("Segment full"));
+        }
 
         let mut records_buf: Vec<u8> = Vec::new();
         let mut index_buf: Vec<u8> = Vec::new();
         for record in &req.records {
             let pos = records_buf.len() as u32;
-            record.encode_length_delimited(&mut records_buf).unwrap(); // TODO: no unwrap
+            record
+                .encode_length_delimited(&mut records_buf)
+                .expect("protobuf encoding should succeed");
+            if (records_start_pos as u64) + (records_buf.len() as u64) > (u32::MAX as u64) {
+                // TODO: store fact that segment is closed.
+                return Err(Status::out_of_range("Segment full"));
+            }
             index_buf.extend_from_slice(&(records_start_pos + pos).to_le_bytes());
         }
-        // TODO: reject (segment must be closed) if records_start_pos+records_buf.len() > u32::MAX
+
         records_file.write_all(&records_buf).await?;
         index_file.write_all(&index_buf).await?;
         records_file.sync_all().await?;
         index_file.sync_all().await?;
 
         Ok(Response::new(WriteResponse {
-            at_offset: records_start_count,
-            next_offset: records_start_count + req.records.len() as u32,
+            at_offset: first_record_offset,
+            next_offset: first_record_offset + req.records.len() as u32,
         }))
     }
 
