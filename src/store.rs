@@ -19,7 +19,7 @@ pub mod aeroflux {
 use aeroflux::{
     read_response::Event,
     store_server::{Store, StoreServer},
-    Empty, ReadRequest, ReadResponse, Record, Timestamp, WriteRequest, WriteResponse,
+    Empty, ErrorCode, ReadRequest, ReadResponse, Record, Timestamp, WriteRequest, WriteResponse,
 };
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -131,16 +131,41 @@ impl Store for StoreService {
 
         // Read and send every record in record_range
         let record_range = req.from_offset..record_count;
-        let mut records_file = OpenOptions::new()
+        let records_file = OpenOptions::new()
             .read(true)
             .open(pathing.records_file_path())
             .await?; // TODO: convert error
         tokio::spawn(
             async move {
-                Self::read_and_send(record_range, records_file, from_pos, stream_tx)
+                Self::read_and_send(record_range, records_file, from_pos, &stream_tx)
                     .await
-                    .expect("Reading and sending should work")
-                // TODO: log on send error; send an error on file io error
+                    .or_else(|err| {
+                        if let Some(status) = err.downcast_ref::<Status>() {
+                            warn!("Error sending: {}", status);
+                            Ok(())
+                        } else if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+                            error!("IO Error: {}", io_err);
+                            stream_tx
+                                .send(Ok(ReadResponse {
+                                    event: Some(Event::Error(ErrorCode::IoError as i32)),
+                                }))
+                                .await;
+                            Ok(())
+                        } else {
+                            error!("Unknown Error: {}", err);
+                            Ok(())
+                        }
+                    })
+                    .expect("Reading and sending should work");
+
+                // Send end
+                stream_tx
+                    .send(Ok(ReadResponse {
+                        event: Some(Event::End(Empty {})),
+                    }))
+                    .await
+                    .unwrap();
+                info!("done");
             }
             .instrument(info_span!("")),
         );
@@ -155,7 +180,7 @@ impl StoreService {
         record_range: Range<u32>,
         mut records_file: fs::File,
         mut file_pos: u64,
-        stream_tx: Sender<Result<ReadResponse, Status>>,
+        stream_tx: &Sender<Result<ReadResponse, Status>>,
     ) -> Result<(), Error> {
         info!("start");
         records_file.seek(SeekFrom::Start(file_pos)).await?;
@@ -183,13 +208,6 @@ impl StoreService {
             file_pos = record_start_pos + record_length as u64;
         }
 
-        // Send end
-        stream_tx
-            .send(Ok(ReadResponse {
-                event: Some(Event::End(Empty {})),
-            }))
-            .await?;
-        info!("done");
         Ok(())
     }
 }
