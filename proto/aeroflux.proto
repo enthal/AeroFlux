@@ -38,9 +38,11 @@ message ReadResponse {
 }
 
 enum ErrorCode {
-    ERROR_UNSPECIFIED = 0;
-    ERROR_NO_SUCH_SEGMENT = 1;
-    ERROR_NO_SUCH_OFFSET_IN_SEGMENT = 2;
+    UNSPECIFIED = 0;
+    NO_SUCH_SEGMENT = 1;
+    NO_SUCH_OFFSET_IN_SEGMENT = 2;
+    IO_ERROR = 3;
+    PROTOBUF_ERROR = 4;
 }
 
 // Base types

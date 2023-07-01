@@ -1,6 +1,6 @@
 use std::{io::SeekFrom, mem::size_of, ops::Range};
 
-use prost::Message;
+use prost::{DecodeError, Message};
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
@@ -19,7 +19,7 @@ pub mod aeroflux {
 use aeroflux::{
     read_response::Event,
     store_server::{Store, StoreServer},
-    Empty, ReadRequest, ReadResponse, Record, Timestamp, WriteRequest, WriteResponse,
+    Empty, ErrorCode, ReadRequest, ReadResponse, Record, Timestamp, WriteRequest, WriteResponse,
 };
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -99,7 +99,6 @@ impl Store for StoreService {
 
     #[instrument(err, skip(self, req), fields(req = ?req.get_ref()))]
     async fn read(&self, req: Request<ReadRequest>) -> Result<Response<Self::ReadStream>, Status> {
-        info!("start");
         let req = req.get_ref();
         let pathing = Pathing {
             topic: req.topic.clone(),
@@ -131,16 +130,35 @@ impl Store for StoreService {
 
         // Read and send every record in record_range
         let record_range = req.from_offset..record_count;
-        let mut records_file = OpenOptions::new()
+        let records_file = OpenOptions::new()
             .read(true)
             .open(pathing.records_file_path())
             .await?; // TODO: convert error
         tokio::spawn(
             async move {
-                Self::read_and_send(record_range, records_file, from_pos, stream_tx)
-                    .await
-                    .expect("Reading and sending should work")
-                // TODO: log on send error; send an error on file io error
+                let terminate = |event: Event| async {
+                    stream_tx
+                        .send(Ok(ReadResponse { event: Some(event) }))
+                        .await
+                        .ok(); // best effort
+                };
+                match Self::read_and_send(record_range, records_file, from_pos, &stream_tx).await {
+                    Ok(_) => {
+                        terminate(Event::End(Empty {})).await;
+                    }
+                    Err(err) => {
+                        if false {
+                        } else if let Some(_) = err.downcast_ref::<Status>() {
+                            // Error on send.  Don't try to send again.
+                        } else if let Some(_) = err.downcast_ref::<DecodeError>() {
+                            terminate(Event::Error(ErrorCode::ProtobufError as i32)).await;
+                        } else if let Some(_) = err.downcast_ref::<std::io::Error>() {
+                            terminate(Event::Error(ErrorCode::IoError as i32)).await;
+                        } else {
+                            error!("Unknown Error: {}", err);
+                        }
+                    }
+                }
             }
             .instrument(info_span!("")),
         );
@@ -155,9 +173,11 @@ impl StoreService {
         record_range: Range<u32>,
         mut records_file: fs::File,
         mut file_pos: u64,
-        stream_tx: Sender<Result<ReadResponse, Status>>,
+        stream_tx: &Sender<Result<ReadResponse, Status>>,
     ) -> Result<(), Error> {
         info!("start");
+        //file_pos += 300;
+
         records_file.seek(SeekFrom::Start(file_pos)).await?;
         for _ in record_range {
             // Frame: Decode variable-length record length_delimiter.
@@ -183,17 +203,10 @@ impl StoreService {
             file_pos = record_start_pos + record_length as u64;
         }
 
-        // Send end
-        stream_tx
-            .send(Ok(ReadResponse {
-                event: Some(Event::End(Empty {})),
-            }))
-            .await?;
-        info!("done");
+        info!("end");
         Ok(())
     }
 }
-impl StoreService {}
 
 #[derive(Debug)]
 pub struct Pathing {
