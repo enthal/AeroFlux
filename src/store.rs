@@ -12,11 +12,15 @@ use tracing::*;
 
 pub mod aeroflux {
     tonic::include_proto!("aeroflux");
+
+    pub(crate) const FILE_DESCRIPTOR_SET: &[u8] =
+        tonic::include_file_descriptor_set!("aeroflux_descriptor");
 }
 use aeroflux::{
     read_response::Event,
     store_server::{Store, StoreServer},
     Empty, ErrorCode, ReadRequest, ReadResponse, Record, WriteRequest, WriteResponse,
+    FILE_DESCRIPTOR_SET,
 };
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -26,10 +30,15 @@ async fn main() -> Result<(), Error> {
     let subscriber = tracing_subscriber::FmtSubscriber::new();
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
+    let reflection_service = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
+        .build()?;
+
     let addr = "[::1]:11000".parse().unwrap();
     info!("Listen: {addr}");
     Server::builder()
         .add_service(StoreServer::new(StoreService {}))
+        .add_service(reflection_service)
         .serve(addr)
         .await?;
 
