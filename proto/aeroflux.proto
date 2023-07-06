@@ -2,8 +2,14 @@ syntax = "proto3";
 package aeroflux;
 
 service Store {
+    rpc CreateSegment(CreateSegmentRequest) returns (Empty);
     rpc Write (WriteRequest) returns (WriteResponse);
     rpc Read (ReadRequest) returns (stream ReadResponse);
+}
+
+message CreateSegmentRequest {
+    string topic = 1;
+    uint64 segment_index = 2;
 }
 
 message WriteRequest {

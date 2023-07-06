@@ -1,6 +1,13 @@
-use std::{io::SeekFrom, mem::size_of, ops::Range};
+use std::{
+    collections::HashMap,
+    io::SeekFrom,
+    mem::size_of,
+    ops::Range,
+    sync::{Arc, Mutex},
+};
 
 use prost::{DecodeError, Message};
+use std::sync::atomic::AtomicU32;
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
@@ -19,8 +26,8 @@ pub mod aeroflux {
 use aeroflux::{
     read_response::Event,
     store_server::{Store, StoreServer},
-    Empty, ErrorCode, ReadRequest, ReadResponse, Record, WriteRequest, WriteResponse,
-    FILE_DESCRIPTOR_SET,
+    CreateSegmentRequest, Empty, ErrorCode, ReadRequest, ReadResponse, Record, WriteRequest,
+    WriteResponse, FILE_DESCRIPTOR_SET,
 };
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -37,7 +44,7 @@ async fn main() -> Result<(), Error> {
     let addr = "[::1]:11000".parse().unwrap();
     info!("Listen: {addr}");
     Server::builder()
-        .add_service(StoreServer::new(StoreService {}))
+        .add_service(StoreServer::new(StoreService::new()))
         .add_service(reflection_service)
         .serve(addr)
         .await?;
@@ -45,11 +52,73 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
+#[derive(Debug, Hash, PartialEq, Eq)]
+pub struct SegmentID {
+    topic: String,
+    segment_index: u64,
+}
+
 #[derive(Debug)]
-pub struct StoreService {}
+pub struct SegmentSink {
+    // topic: String,
+    // segment_index: u64,
+    next_offset: AtomicU32,
+    tx: Option<Sender<Record>>, // None when closed
+}
+type SegementsById = Arc<Mutex<HashMap<SegmentID, SegmentSink>>>;
+
+#[derive(Debug)]
+pub struct StoreService {
+    segements_by_id: SegementsById,
+}
+impl StoreService {
+    fn new() -> StoreService {
+        StoreService {
+            segements_by_id: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
 
 #[tonic::async_trait]
 impl Store for StoreService {
+    //
+
+    #[instrument(err, skip(self, req), fields(req = ?req.get_ref()))]
+    async fn create_segment(
+        &self,
+        req: Request<CreateSegmentRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let req = req.get_ref();
+
+        let mut db = self.segements_by_id.lock().unwrap();
+        let segment_id = SegmentID {
+            segment_index: req.segment_index,
+            topic: req.topic.clone(),
+        };
+        if db.contains_key(&segment_id) {
+            return Err(Status::already_exists(format!(
+                "Segment already exists: {:?}",
+                segment_id
+            )));
+        }
+        let (tx, rx) = mpsc::channel(16); // TODO: tunable? Backpressure is appropriate.
+
+        db.insert(
+            segment_id,
+            SegmentSink {
+                next_offset: AtomicU32::new(0),
+                tx: Some(tx),
+            },
+        );
+
+        info!("Created segment; Open segment count: {}", db.len());
+
+        // TODO: tokio::spawn( async move {
+        // TODO:   make dirs, open files, receive from rx, write to file
+
+        Ok(Response::new(Empty {}))
+    }
+
     #[instrument(err, skip(self, req), fields(req = ?req.get_ref()))]
     async fn write(&self, req: Request<WriteRequest>) -> Result<Response<WriteResponse>, Status> {
         info!("start");
@@ -200,7 +269,7 @@ impl StoreService {
         //file_pos += 300;
 
         records_file.seek(SeekFrom::Start(file_pos)).await?;
-        for _ in record_range {
+        for offset in record_range {
             // Frame: Decode variable-length record length_delimiter.
             // TODO: consider using fixed-length (4 byte?) record length_delimiter.
             let mut length_delimiter_buf = [0; 10]; // decode_length_delimiter needs exactly 10
@@ -208,6 +277,7 @@ impl StoreService {
             let record_length = prost::decode_length_delimiter(&length_delimiter_buf[..])?;
             let record_start_pos =
                 file_pos as u64 + prost::length_delimiter_len(record_length) as u64;
+            info!("offset:{}, length:{}", offset, record_length);
             records_file.seek(SeekFrom::Start(record_start_pos)).await?;
 
             // Read and send record
