@@ -41,10 +41,13 @@ async fn main() -> Result<(), Error> {
         .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
         .build()?;
 
+    let store_service = StoreService::new();
+    store_service.on_startup().await?;
+
     let addr = "[::1]:11000".parse().unwrap();
     info!("Listen: {addr}");
     Server::builder()
-        .add_service(StoreServer::new(StoreService::new()))
+        .add_service(StoreServer::new(store_service))
         .add_service(reflection_service)
         .serve(addr)
         .await?;
@@ -76,6 +79,33 @@ impl StoreService {
         StoreService {
             segements_by_id: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+}
+
+impl StoreService {
+    #[instrument(err, skip(self))]
+    async fn on_startup(&self) -> Result<(), Error> {
+        info!("");
+        fs::create_dir_all(Pathing::topics_dir_path()).await?;
+        let mut topics_dir = fs::read_dir(Pathing::topics_dir_path()).await?;
+        while let Some(topic_dir_entry) = topics_dir.next_entry().await? {
+            let topic_name = topic_dir_entry
+                .file_name()
+                .into_string()
+                .expect("sane topic name"); // TODO: don't panic
+            info!("Topic: {}", topic_name);
+            let mut segments_dir = fs::read_dir(topic_dir_entry.path()).await?;
+            while let Some(segment_dir_entry) = segments_dir.next_entry().await? {
+                let segment_index: u32 = segment_dir_entry
+                    .file_name()
+                    .into_string()
+                    .expect("sane segment name") // TODO: don't panic
+                    .parse()?; // TODO: skip bad segment dir names?
+                info!("  Segment: {}", segment_index);
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -305,8 +335,11 @@ pub struct Pathing {
     segment_index: u64,
 }
 impl Pathing {
-    const ROOT_PATH: &str = ".data/";
+    const ROOT_PATH: &str = ".data";
 
+    fn topics_dir_path() -> String {
+        format!("{}/topics", Pathing::ROOT_PATH)
+    }
     fn segment_dir_path(&self) -> String {
         format!(
             "{}/topics/{}/{}",
