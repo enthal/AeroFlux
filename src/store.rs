@@ -87,6 +87,7 @@ impl StoreService {
     async fn on_startup(&self) -> Result<(), Error> {
         info!("");
         fs::create_dir_all(Pathing::topics_dir_path()).await?;
+
         let mut topics_dir = fs::read_dir(Pathing::topics_dir_path()).await?;
         while let Some(topic_dir_entry) = topics_dir.next_entry().await? {
             let topic_name = topic_dir_entry
@@ -94,17 +95,25 @@ impl StoreService {
                 .into_string()
                 .expect("sane topic name"); // TODO: don't panic
             info!("Topic: {}", topic_name);
+
             let mut segments_dir = fs::read_dir(topic_dir_entry.path()).await?;
             while let Some(segment_dir_entry) = segments_dir.next_entry().await? {
-                let segment_index: u32 = segment_dir_entry
+                let segment_index: u64 = segment_dir_entry
                     .file_name()
                     .into_string()
                     .expect("sane segment name") // TODO: don't panic
                     .parse()?; // TODO: skip bad segment dir names?
                 info!("  Segment: {}", segment_index);
+
+                let segment_id = SegmentID {
+                    topic: topic_name.clone(),
+                    segment_index: segment_index,
+                };
+                self.create_segment(segment_id).await?
             }
         }
 
+        info!("done");
         Ok(())
     }
 
