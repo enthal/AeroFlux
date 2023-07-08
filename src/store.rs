@@ -128,7 +128,7 @@ impl Store for StoreService {
             segment_index: req.segment_index,
         };
 
-        fs::create_dir_all(pathing.topic_dir_path()).await?;
+        fs::create_dir_all(pathing.segment_dir_path()).await?;
 
         let mut records_file = OpenOptions::new()
             .create(true)
@@ -307,13 +307,18 @@ pub struct Pathing {
 impl Pathing {
     const ROOT_PATH: &str = ".data/";
 
-    fn topic_dir_path(&self) -> String {
-        format!("{}/{}", Pathing::ROOT_PATH, self.topic)
+    fn segment_dir_path(&self) -> String {
+        format!(
+            "{}/topics/{}/{}",
+            Pathing::ROOT_PATH,
+            self.topic,
+            self.segment_index
+        )
     }
     fn records_file_path(&self) -> String {
-        format!("{}/{}.records", self.topic_dir_path(), self.segment_index)
+        format!("{}/records", self.segment_dir_path())
     }
     fn index_file_path(&self) -> String {
-        format!("{}/{}.index", self.topic_dir_path(), self.segment_index)
+        format!("{}/index", self.segment_dir_path())
     }
 }
