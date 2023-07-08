@@ -107,31 +107,17 @@ impl StoreService {
 
         Ok(())
     }
-}
 
-#[tonic::async_trait]
-impl Store for StoreService {
-    //
-
-    #[instrument(err, skip(self, req), fields(req = ?req.get_ref()))]
-    async fn create_segment(
-        &self,
-        req: Request<CreateSegmentRequest>,
-    ) -> Result<Response<Empty>, Status> {
-        let req = req.get_ref();
-
-        let mut db = self.segements_by_id.lock().unwrap();
-        let segment_id = SegmentID {
-            segment_index: req.segment_index,
-            topic: req.topic.clone(),
-        };
+    async fn create_segment(&self, segment_id: SegmentID) -> Result<(), Status> {
+        let mut db = self.segements_by_id.lock().expect("Mutex should be valid");
         if db.contains_key(&segment_id) {
             return Err(Status::already_exists(format!(
                 "Segment already exists: {:?}",
                 segment_id
             )));
         }
-        let (tx, rx) = mpsc::channel(16); // TODO: tunable? Backpressure is appropriate.
+
+        let (tx, mut rx) = mpsc::channel(16); // TODO: tunable? Backpressure is appropriate.
 
         db.insert(
             segment_id,
@@ -141,10 +127,39 @@ impl Store for StoreService {
             },
         );
 
+        tokio::spawn(async move {
+            // TODO:   make dirs, open files, ...
+
+            // receive from rx, write to file
+            loop {
+                let msg = rx.recv().await;
+                // TODO: etc
+            }
+        });
+
         info!("Created segment; Open segment count: {}", db.len());
 
-        // TODO: tokio::spawn( async move {
-        // TODO:   make dirs, open files, receive from rx, write to file
+        Ok(())
+    }
+}
+
+#[tonic::async_trait]
+impl Store for StoreService {
+    //
+
+    #[instrument(res, err, skip(self, req), fields(req = ?req.get_ref()))]
+    async fn create_segment(
+        &self,
+        req: Request<CreateSegmentRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let req = req.get_ref();
+
+        let segment_id = SegmentID {
+            topic: req.topic.clone(),
+            segment_index: req.segment_index,
+        };
+
+        self.create_segment(segment_id).await?;
 
         Ok(Response::new(Empty {}))
     }
