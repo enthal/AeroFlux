@@ -136,68 +136,79 @@ impl StoreService {
             },
         );
 
-        tokio::spawn(async move {
-            let pathing = Pathing {
-                topic: segment_id.topic,
-                segment_index: segment_id.segment_index,
-            };
+        tokio::spawn(
+            async move {
+                // TODO: Handle returned errors somehow.
 
-            fs::create_dir_all(pathing.segment_dir_path()).await?;
+                let pathing = Pathing {
+                    topic: segment_id.topic,
+                    segment_index: segment_id.segment_index,
+                };
 
-            let mut records_file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(pathing.records_file_path())
-                .await?;
-            let mut index_file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(pathing.index_file_path())
-                .await?;
+                fs::create_dir_all(pathing.segment_dir_path()).await?;
 
-            // Note: pos means byte index in records_file; offset means record offset in segment.
+                let mut records_file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(pathing.records_file_path())
+                    .await?;
+                let mut index_file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(pathing.index_file_path())
+                    .await?;
 
-            // records_file must not be longer than u32::MAX, since its length must fit in a 4-byte index file entry.
-            let records_start_pos = async {
-                let len = records_file.metadata().await?.len();
-                if len > u32::MAX as u64 {
-                    Err(Status::data_loss("records_file is too large"))
-                } else {
-                    Ok(len as u32)
+                // Note: pos means byte index in records_file; offset means record offset in segment.
+
+                // records_file must not be longer than u32::MAX, since its length must fit in a 4-byte index file entry.
+                let mut records_next_pos = async {
+                    let len = records_file.metadata().await?.len();
+                    if len > u32::MAX as u64 {
+                        Err(Status::data_loss("records_file is too large"))
+                    } else {
+                        Ok(len as u32)
+                    }
                 }
-            }
-            .await?;
+                .await?;
 
-            // records_file must have fewer than u32::MAX records; TODO: else error (the file is corrupt)
-            let first_record_offset =
-                index_file.metadata().await?.len() as u32 / size_of::<u32>() as u32;
-            if (first_record_offset as u64) > (u32::MAX as u64) {
-                // TODO: store fact that segment is closed.
-                return Err(Status::out_of_range("Segment full"));
-            }
-
-            // TODO: Bytes/Buf
-            let mut records_buf: Vec<u8> = Vec::new();
-            let mut index_buf: Vec<u8> = Vec::new();
-            while let Some(record) = rx.recv().await {
-                let pos = records_buf.len() as u32;
-                record
-                    .encode_length_delimited(&mut records_buf)
-                    .expect("protobuf encoding should succeed");
-                if (records_start_pos as u64) + (records_buf.len() as u64) > (u32::MAX as u64) {
+                // records_file must have fewer than u32::MAX records; TODO: else error (the file is corrupt)
+                let first_record_offset =
+                    index_file.metadata().await?.len() / size_of::<u32>() as u64;
+                if (first_record_offset) > (u32::MAX as u64) {
                     // TODO: store fact that segment is closed.
                     return Err(Status::out_of_range("Segment full"));
                 }
-                index_buf.extend_from_slice(&(records_start_pos + pos).to_le_bytes());
 
-                records_file.write_all(&records_buf).await?;
-                index_file.write_all(&index_buf).await?;
-                records_file.sync_all().await?;
-                index_file.sync_all().await?;
+                // TODO: Bytes/Buf
+                let mut records_buf: Vec<u8> = Vec::new();
+                while let Some(record) = rx.recv().await {
+                    info!("Write record to pos [{}]", records_next_pos);
+                    records_buf.clear();
+                    record
+                        .encode_length_delimited(&mut records_buf)
+                        .expect("protobuf encoding should succeed");
+                    if (records_next_pos as u64) + (records_buf.len() as u64) > (u32::MAX as u64) {
+                        // TODO: store fact that segment is closed.
+                        return Err(Status::out_of_range("Segment full"));
+                    }
+
+                    // TODO: await write and sync call pairs together
+                    records_file.write_all(&records_buf).await?;
+                    index_file
+                        .write_all(&(records_next_pos).to_le_bytes())
+                        .await?;
+
+                    // TODO: can we not call this on every record?  Maybe on some Sync message...?
+                    records_file.sync_all().await?;
+                    index_file.sync_all().await?;
+
+                    records_next_pos += records_buf.len() as u32;
+                }
+
+                Ok(())
             }
-
-            Ok(())
-        });
+            .instrument(info_span!("write loop")),
+        );
 
         info!("Created segment; Open segment count: {}", db.len());
 
@@ -226,7 +237,7 @@ impl Store for StoreService {
         Ok(Response::new(Empty {}))
     }
 
-    #[instrument(err, skip(self, req), fields(req = ?req.get_ref()))]
+    #[instrument(err, skip(self, req), fields(req = ?req.get_ref()))] // TODO: don't log the req data!
     async fn write(&self, req: Request<WriteRequest>) -> Result<Response<WriteResponse>, Status> {
         info!("start");
         let req = req.get_ref();
