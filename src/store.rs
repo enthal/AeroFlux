@@ -4,6 +4,7 @@ use std::{
     mem::size_of,
     ops::Range,
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use prost::{DecodeError, Message};
@@ -11,10 +12,13 @@ use std::sync::atomic::AtomicU32;
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    sync::mpsc::{self, Sender},
+    sync::{
+        mpsc::{self, Sender},
+        oneshot,
+    },
 };
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{codegen::http::response, transport::Server, Request, Response, Status};
 use tracing::*;
 
 pub mod aeroflux {
@@ -26,8 +30,8 @@ pub mod aeroflux {
 use aeroflux::{
     read_response::Event,
     store_server::{Store, StoreServer},
-    CreateSegmentRequest, Empty, ErrorCode, ReadRequest, ReadResponse, Record, WriteRequest,
-    WriteResponse, FILE_DESCRIPTOR_SET,
+    CreateSegmentRequest, Empty, ErrorCode, ReadRequest, ReadResponse, Record, Timestamp,
+    WriteRequest, WriteResponse, FILE_DESCRIPTOR_SET,
 };
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -66,9 +70,18 @@ pub struct SegmentSink {
     // topic: String,
     // segment_index: u64,
     next_offset: AtomicU32,
-    tx: Option<Sender<Record>>, // None when closed
+    tx: Option<Sender<WriteEvent>>, // None when closed
 }
 type SegementsById = Arc<Mutex<HashMap<SegmentID, SegmentSink>>>;
+
+enum WriteEvent {
+    Record(Record),
+    Sync(SyncEvent),
+}
+
+struct SyncEvent {
+    tx: Option<oneshot::Sender<WriteResponse>>,
+}
 
 #[derive(Debug)]
 pub struct StoreService {
@@ -172,37 +185,56 @@ impl StoreService {
                 .await?;
 
                 // records_file must have fewer than u32::MAX records; TODO: else error (the file is corrupt)
-                let first_record_offset =
-                    index_file.metadata().await?.len() / size_of::<u32>() as u64;
-                if (first_record_offset) > (u32::MAX as u64) {
+                let next_offset = index_file.metadata().await?.len() / size_of::<u32>() as u64;
+                if (next_offset) > (u32::MAX as u64) {
                     // TODO: store fact that segment is closed.
                     return Err(Status::out_of_range("Segment full"));
                 }
+                let mut next_offset = next_offset as u32;
 
                 // TODO: Bytes/Buf
                 let mut records_buf: Vec<u8> = Vec::new();
-                while let Some(record) = rx.recv().await {
-                    info!("Write record to pos [{}]", records_next_pos);
-                    records_buf.clear();
-                    record
-                        .encode_length_delimited(&mut records_buf)
-                        .expect("protobuf encoding should succeed");
-                    if (records_next_pos as u64) + (records_buf.len() as u64) > (u32::MAX as u64) {
-                        // TODO: store fact that segment is closed.
-                        return Err(Status::out_of_range("Segment full"));
+                while let Some(write_event) = rx.recv().await {
+                    match write_event {
+                        WriteEvent::Record(record) => {
+                            info!("Write record to pos [{}]", records_next_pos);
+                            records_buf.clear();
+                            record
+                                .encode_length_delimited(&mut records_buf)
+                                .expect("protobuf encoding should succeed");
+                            if (records_next_pos as u64) + (records_buf.len() as u64)
+                                > (u32::MAX as u64)
+                            {
+                                // TODO: store fact that segment is closed.
+                                return Err(Status::out_of_range("Segment full"));
+                            }
+
+                            // TODO: await write and sync call pairs together
+                            records_file.write_all(&records_buf).await?;
+                            index_file
+                                .write_all(&(records_next_pos).to_le_bytes())
+                                .await?;
+
+                            records_next_pos += records_buf.len() as u32;
+                            next_offset += 1;
+                        }
+                        WriteEvent::Sync(sync_event) => {
+                            records_file.sync_all().await?;
+                            index_file.sync_all().await?;
+
+                            let response = WriteResponse {
+                                timestamp: Some(now()),
+                                next_offset,
+                            };
+                            info!("{:?}", response);
+
+                            if let Some(response_tx) = sync_event.tx {
+                                let _ = response_tx.send(response).map_err(|_| {
+                                    warn!("Sync response listener hung up");
+                                });
+                            }
+                        }
                     }
-
-                    // TODO: await write and sync call pairs together
-                    records_file.write_all(&records_buf).await?;
-                    index_file
-                        .write_all(&(records_next_pos).to_le_bytes())
-                        .await?;
-
-                    // TODO: can we not call this on every record?  Maybe on some Sync message...?
-                    records_file.sync_all().await?;
-                    index_file.sync_all().await?;
-
-                    records_next_pos += records_buf.len() as u32;
                 }
 
                 Ok(())
@@ -260,18 +292,23 @@ impl Store for StoreService {
         }?;
 
         for record in &req.records {
-            tx.send(record.clone())
+            tx.send(WriteEvent::Record(record.clone()))
                 .await
-                .map_err(|_e| Status::failed_precondition("Segment closed"))?
+                .map_err(|_e| Status::data_loss("Segment closed"))?
         }
 
-        Ok(Response::new(WriteResponse {
-            // TODO
-            at_offset: 0,
-            next_offset: 0,
-            // at_offset: first_record_offset,
-            // next_offset: first_record_offset + req.records.len() as u32,
+        let (response_tx, response_rx) = oneshot::channel();
+        tx.send(WriteEvent::Sync(SyncEvent {
+            tx: Some(response_tx),
         }))
+        .await
+        .map_err(|_e| Status::data_loss("Segment closed"))?;
+
+        Ok(Response::new(
+            response_rx
+                .await
+                .map_err(|_e| Status::data_loss("Writer quit"))?,
+        ))
     }
 
     type ReadStream = ReceiverStream<Result<ReadResponse, Status>>;
@@ -383,6 +420,16 @@ impl StoreService {
 
         info!("end");
         Ok(())
+    }
+}
+
+fn now() -> Timestamp {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("current epoch");
+    Timestamp {
+        seconds: now.as_secs(),
+        nanos: now.subsec_nanos(),
     }
 }
 

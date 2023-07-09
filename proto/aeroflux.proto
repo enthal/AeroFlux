@@ -24,7 +24,7 @@ message Record {
 }
 
 message WriteResponse {
-    uint32 at_offset = 1;
+    Timestamp timestamp = 1;
     uint32 next_offset = 2;
 }
 
