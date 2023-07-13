@@ -1,13 +1,24 @@
-use std::{io::SeekFrom, mem::size_of, ops::Range};
+use std::{
+    collections::HashMap,
+    io::SeekFrom,
+    mem::size_of,
+    ops::Range,
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use prost::{DecodeError, Message};
+use std::sync::atomic::AtomicU32;
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    sync::mpsc::{self, Sender},
+    sync::{
+        mpsc::{self, Sender},
+        oneshot,
+    },
 };
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{codegen::http::response, transport::Server, Request, Response, Status};
 use tracing::*;
 
 pub mod aeroflux {
@@ -19,8 +30,8 @@ pub mod aeroflux {
 use aeroflux::{
     read_response::Event,
     store_server::{Store, StoreServer},
-    Empty, ErrorCode, ReadRequest, ReadResponse, Record, WriteRequest, WriteResponse,
-    FILE_DESCRIPTOR_SET,
+    CreateSegmentRequest, Empty, ErrorCode, ReadRequest, ReadResponse, Record, Timestamp,
+    WriteRequest, WriteResponse, FILE_DESCRIPTOR_SET,
 };
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -34,10 +45,13 @@ async fn main() -> Result<(), Error> {
         .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
         .build()?;
 
+    let store_service = StoreService::new();
+    store_service.on_startup().await?;
+
     let addr = "[::1]:11000".parse().unwrap();
     info!("Listen: {addr}");
     Server::builder()
-        .add_service(StoreServer::new(StoreService {}))
+        .add_service(StoreServer::new(store_service))
         .add_service(reflection_service)
         .serve(addr)
         .await?;
@@ -45,77 +59,256 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+pub struct SegmentID {
+    topic: String,
+    segment_index: u64,
+}
+
 #[derive(Debug)]
-pub struct StoreService {}
+pub struct SegmentSink {
+    // topic: String,
+    // segment_index: u64,
+    next_offset: AtomicU32,
+    tx: Option<Sender<WriteEvent>>, // None when closed
+}
+type SegementsById = Arc<Mutex<HashMap<SegmentID, SegmentSink>>>;
+
+enum WriteEvent {
+    Record(Record),
+    Sync(SyncEvent),
+}
+
+struct SyncEvent {
+    tx: Option<oneshot::Sender<WriteResponse>>,
+}
+
+#[derive(Debug)]
+pub struct StoreService {
+    segements_by_id: SegementsById,
+}
+impl StoreService {
+    fn new() -> StoreService {
+        StoreService {
+            segements_by_id: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl StoreService {
+    #[instrument(err, skip(self))]
+    async fn on_startup(&self) -> Result<(), Error> {
+        info!("");
+        fs::create_dir_all(Pathing::topics_dir_path()).await?;
+
+        let mut topics_dir = fs::read_dir(Pathing::topics_dir_path()).await?;
+        while let Some(topic_dir_entry) = topics_dir.next_entry().await? {
+            let topic_name = topic_dir_entry
+                .file_name()
+                .into_string()
+                .expect("sane topic name"); // TODO: don't panic
+            info!("Topic: {}", topic_name);
+
+            let mut segments_dir = fs::read_dir(topic_dir_entry.path()).await?;
+            while let Some(segment_dir_entry) = segments_dir.next_entry().await? {
+                let segment_index: u64 = segment_dir_entry
+                    .file_name()
+                    .into_string()
+                    .expect("sane segment name") // TODO: don't panic
+                    .parse()?; // TODO: skip bad segment dir names?
+                info!("  Segment: {}", segment_index);
+
+                let segment_id = SegmentID {
+                    topic: topic_name.clone(),
+                    segment_index: segment_index,
+                };
+                self.create_segment(segment_id).await?
+            }
+        }
+
+        info!("done");
+        Ok(())
+    }
+
+    async fn create_segment(&self, segment_id: SegmentID) -> Result<(), Status> {
+        let mut db = self.segements_by_id.lock().expect("Mutex should be valid");
+        if db.contains_key(&segment_id) {
+            return Err(Status::already_exists(format!(
+                "Segment already exists: {:?}",
+                segment_id
+            )));
+        }
+
+        let (tx, mut rx) = mpsc::channel(16); // TODO: tunable? Backpressure is appropriate.
+
+        db.insert(
+            segment_id.clone(),
+            SegmentSink {
+                next_offset: AtomicU32::new(0),
+                tx: Some(tx),
+            },
+        );
+
+        tokio::spawn(
+            async move {
+                // TODO: Handle returned errors somehow.
+
+                let pathing = Pathing {
+                    topic: segment_id.topic,
+                    segment_index: segment_id.segment_index,
+                };
+
+                fs::create_dir_all(pathing.segment_dir_path()).await?;
+
+                let mut records_file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(pathing.records_file_path())
+                    .await?;
+                let mut index_file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(pathing.index_file_path())
+                    .await?;
+
+                // Note: pos means byte index in records_file; offset means record offset in segment.
+
+                // records_file must not be longer than u32::MAX, since its length must fit in a 4-byte index file entry.
+                let mut records_next_pos = async {
+                    let len = records_file.metadata().await?.len();
+                    if len > u32::MAX as u64 {
+                        Err(Status::data_loss("records_file is too large"))
+                    } else {
+                        Ok(len as u32)
+                    }
+                }
+                .await?;
+
+                // records_file must have fewer than u32::MAX records; TODO: else error (the file is corrupt)
+                let next_offset = index_file.metadata().await?.len() / size_of::<u32>() as u64;
+                if (next_offset) > (u32::MAX as u64) {
+                    // TODO: store fact that segment is closed.
+                    return Err(Status::out_of_range("Segment full"));
+                }
+                let mut next_offset = next_offset as u32;
+
+                // TODO: Bytes/Buf
+                let mut records_buf: Vec<u8> = Vec::new();
+                while let Some(write_event) = rx.recv().await {
+                    match write_event {
+                        WriteEvent::Record(record) => {
+                            info!("Write record to pos [{}]", records_next_pos);
+                            records_buf.clear();
+                            record
+                                .encode_length_delimited(&mut records_buf)
+                                .expect("protobuf encoding should succeed");
+                            if (records_next_pos as u64) + (records_buf.len() as u64)
+                                > (u32::MAX as u64)
+                            {
+                                // TODO: store fact that segment is closed.
+                                return Err(Status::out_of_range("Segment full"));
+                            }
+
+                            // TODO: await write and sync call pairs together
+                            records_file.write_all(&records_buf).await?;
+                            index_file
+                                .write_all(&(records_next_pos).to_le_bytes())
+                                .await?;
+
+                            records_next_pos += records_buf.len() as u32;
+                            next_offset += 1;
+                        }
+                        WriteEvent::Sync(sync_event) => {
+                            records_file.sync_all().await?;
+                            index_file.sync_all().await?;
+
+                            let response = WriteResponse {
+                                timestamp: Some(now()),
+                                next_offset,
+                            };
+                            info!("{:?}", response);
+
+                            if let Some(response_tx) = sync_event.tx {
+                                let _ = response_tx.send(response).map_err(|_| {
+                                    warn!("Sync response listener hung up");
+                                });
+                            }
+                        }
+                    }
+                }
+
+                Ok(())
+            }
+            .instrument(info_span!("write loop")),
+        );
+
+        info!("Created segment; Open segment count: {}", db.len());
+
+        Ok(())
+    }
+}
 
 #[tonic::async_trait]
 impl Store for StoreService {
-    #[instrument(err, skip(self, req), fields(req = ?req.get_ref()))]
-    async fn write(&self, req: Request<WriteRequest>) -> Result<Response<WriteResponse>, Status> {
-        info!("start");
+    //
+
+    #[instrument(res, err, skip(self, req), fields(req = ?req.get_ref()))]
+    async fn create_segment(
+        &self,
+        req: Request<CreateSegmentRequest>,
+    ) -> Result<Response<Empty>, Status> {
         let req = req.get_ref();
-        let pathing = Pathing {
+
+        let segment_id = SegmentID {
             topic: req.topic.clone(),
             segment_index: req.segment_index,
         };
 
-        fs::create_dir_all(pathing.topic_dir_path()).await?;
+        self.create_segment(segment_id).await?;
 
-        let mut records_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(pathing.records_file_path())
-            .await?;
-        let mut index_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(pathing.index_file_path())
-            .await?;
+        Ok(Response::new(Empty {}))
+    }
 
-        // Note: pos means byte index in records_file; offset means record offset in segment.
+    #[instrument(err, skip(self, req), fields(req = ?req.get_ref()))] // TODO: don't log the req data!
+    async fn write(&self, req: Request<WriteRequest>) -> Result<Response<WriteResponse>, Status> {
+        info!("start");
+        let req = req.get_ref();
 
-        // records_file must not be longer than u32::MAX, since its length must fit in a 4-byte index file entry.
-        let records_start_pos = async {
-            let len = records_file.metadata().await?.len();
-            if len > u32::MAX as u64 {
-                Err(Status::data_loss("records_file is too large"))
-            } else {
-                Ok(len as u32)
-            }
-        }
-        .await?;
+        let segment_id = SegmentID {
+            topic: req.topic.clone(),
+            segment_index: req.segment_index,
+        };
+        let tx = match self
+            .segements_by_id
+            .lock()
+            .expect("Mutex should be valid")
+            .get(&segment_id)
+        {
+            None => Err(Status::not_found("No such topic segment")),
+            Some(sink) => sink
+                .tx
+                .clone()
+                .ok_or_else(|| Status::failed_precondition("Segment is closed")),
+        }?;
 
-        // records_file must have fewer than u32::MAX records; TODO: else error (the file is corrupt)
-        let first_record_offset =
-            index_file.metadata().await?.len() as u32 / size_of::<u32>() as u32;
-        if (first_record_offset as u64) + (req.records.len() as u64) > (u32::MAX as u64) {
-            // TODO: store fact that segment is closed.
-            return Err(Status::out_of_range("Segment full"));
-        }
-
-        let mut records_buf: Vec<u8> = Vec::new();
-        let mut index_buf: Vec<u8> = Vec::new();
         for record in &req.records {
-            let pos = records_buf.len() as u32;
-            record
-                .encode_length_delimited(&mut records_buf)
-                .expect("protobuf encoding should succeed");
-            if (records_start_pos as u64) + (records_buf.len() as u64) > (u32::MAX as u64) {
-                // TODO: store fact that segment is closed.
-                return Err(Status::out_of_range("Segment full"));
-            }
-            index_buf.extend_from_slice(&(records_start_pos + pos).to_le_bytes());
+            tx.send(WriteEvent::Record(record.clone()))
+                .await
+                .map_err(|_e| Status::data_loss("Segment closed"))?
         }
 
-        records_file.write_all(&records_buf).await?;
-        index_file.write_all(&index_buf).await?;
-        records_file.sync_all().await?;
-        index_file.sync_all().await?;
-
-        Ok(Response::new(WriteResponse {
-            at_offset: first_record_offset,
-            next_offset: first_record_offset + req.records.len() as u32,
+        let (response_tx, response_rx) = oneshot::channel();
+        tx.send(WriteEvent::Sync(SyncEvent {
+            tx: Some(response_tx),
         }))
+        .await
+        .map_err(|_e| Status::data_loss("Segment closed"))?;
+
+        Ok(Response::new(
+            response_rx
+                .await
+                .map_err(|_e| Status::data_loss("Writer quit"))?,
+        ))
     }
 
     type ReadStream = ReceiverStream<Result<ReadResponse, Status>>;
@@ -200,7 +393,7 @@ impl StoreService {
         //file_pos += 300;
 
         records_file.seek(SeekFrom::Start(file_pos)).await?;
-        for _ in record_range {
+        for offset in record_range {
             // Frame: Decode variable-length record length_delimiter.
             // TODO: consider using fixed-length (4 byte?) record length_delimiter.
             let mut length_delimiter_buf = [0; 10]; // decode_length_delimiter needs exactly 10
@@ -208,6 +401,7 @@ impl StoreService {
             let record_length = prost::decode_length_delimiter(&length_delimiter_buf[..])?;
             let record_start_pos =
                 file_pos as u64 + prost::length_delimiter_len(record_length) as u64;
+            info!("offset:{}, length:{}", offset, record_length);
             records_file.seek(SeekFrom::Start(record_start_pos)).await?;
 
             // Read and send record
@@ -229,21 +423,39 @@ impl StoreService {
     }
 }
 
+fn now() -> Timestamp {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("current epoch");
+    Timestamp {
+        seconds: now.as_secs(),
+        nanos: now.subsec_nanos(),
+    }
+}
+
 #[derive(Debug)]
 pub struct Pathing {
     topic: String,
     segment_index: u64,
 }
 impl Pathing {
-    const ROOT_PATH: &str = ".data/";
+    const ROOT_PATH: &str = ".data";
 
-    fn topic_dir_path(&self) -> String {
-        format!("{}/{}", Pathing::ROOT_PATH, self.topic)
+    fn topics_dir_path() -> String {
+        format!("{}/topics", Pathing::ROOT_PATH)
+    }
+    fn segment_dir_path(&self) -> String {
+        format!(
+            "{}/topics/{}/{}",
+            Pathing::ROOT_PATH,
+            self.topic,
+            self.segment_index
+        )
     }
     fn records_file_path(&self) -> String {
-        format!("{}/{}.records", self.topic_dir_path(), self.segment_index)
+        format!("{}/records", self.segment_dir_path())
     }
     fn index_file_path(&self) -> String {
-        format!("{}/{}.index", self.topic_dir_path(), self.segment_index)
+        format!("{}/index", self.segment_dir_path())
     }
 }
