@@ -45,7 +45,7 @@ async fn main() -> Result<(), Error> {
         .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
         .build()?;
 
-    let store_service = StoreService::new();
+    let store_service = StoreService::new(".data".to_string());
     store_service.on_startup().await?;
 
     let addr = "[::1]:11000".parse().unwrap();
@@ -85,11 +85,13 @@ struct SyncEvent {
 
 #[derive(Debug)]
 pub struct StoreService {
+    root_path: String,
     segements_by_id: SegementsById,
 }
 impl StoreService {
-    fn new() -> StoreService {
+    fn new(root_path: String) -> StoreService {
         StoreService {
+            root_path,
             segements_by_id: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -99,9 +101,14 @@ impl StoreService {
     #[instrument(err, skip(self))]
     async fn on_startup(&self) -> Result<(), Error> {
         info!("");
-        fs::create_dir_all(Pathing::topics_dir_path()).await?;
+        let pathing = Pathing {
+            root: self.root_path.clone(),
+            topic: "unused".to_string(),
+            segment_index: 0,
+        };
+        fs::create_dir_all(pathing.topics_dir_path()).await?;
 
-        let mut topics_dir = fs::read_dir(Pathing::topics_dir_path()).await?;
+        let mut topics_dir = fs::read_dir(pathing.topics_dir_path()).await?;
         while let Some(topic_dir_entry) = topics_dir.next_entry().await? {
             let topic_name = topic_dir_entry
                 .file_name()
@@ -149,14 +156,14 @@ impl StoreService {
             },
         );
 
+        let pathing = Pathing {
+            root: self.root_path.clone(),
+            topic: segment_id.topic,
+            segment_index: segment_id.segment_index,
+        };
         tokio::spawn(
             async move {
                 // TODO: Handle returned errors somehow.
-
-                let pathing = Pathing {
-                    topic: segment_id.topic,
-                    segment_index: segment_id.segment_index,
-                };
 
                 fs::create_dir_all(pathing.segment_dir_path()).await?;
 
@@ -317,6 +324,7 @@ impl Store for StoreService {
     async fn read(&self, req: Request<ReadRequest>) -> Result<Response<Self::ReadStream>, Status> {
         let req = req.get_ref();
         let pathing = Pathing {
+            root: self.root_path.clone(),
             topic: req.topic.clone(),
             segment_index: req.segment_index,
         };
@@ -397,7 +405,7 @@ impl StoreService {
             // Frame: Decode variable-length record length_delimiter.
             // TODO: consider using fixed-length (4 byte?) record length_delimiter.
             let mut length_delimiter_buf = [0; 10]; // decode_length_delimiter needs exactly 10
-            records_file.read_exact(&mut length_delimiter_buf).await?;
+            records_file.read(&mut length_delimiter_buf).await?;
             let record_length = prost::decode_length_delimiter(&length_delimiter_buf[..])?;
             let record_start_pos =
                 file_pos as u64 + prost::length_delimiter_len(record_length) as u64;
@@ -435,19 +443,18 @@ fn now() -> Timestamp {
 
 #[derive(Debug)]
 pub struct Pathing {
+    root: String,
     topic: String,
     segment_index: u64,
 }
 impl Pathing {
-    const ROOT_PATH: &str = ".data";
-
-    fn topics_dir_path() -> String {
-        format!("{}/topics", Pathing::ROOT_PATH)
+    fn topics_dir_path(&self) -> String {
+        format!("{}/topics", self.root)
     }
     fn segment_dir_path(&self) -> String {
         format!(
-            "{}/topics/{}/{}",
-            Pathing::ROOT_PATH,
+            "{}/{}/{}",
+            self.topics_dir_path(),
             self.topic,
             self.segment_index
         )
@@ -457,5 +464,148 @@ impl Pathing {
     }
     fn index_file_path(&self) -> String {
         format!("{}/index", self.segment_dir_path())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+
+    use tokio::fs;
+    use tonic::Request;
+
+    use crate::aeroflux::read_response::Event;
+    use crate::aeroflux::store_server::Store;
+    use crate::aeroflux::Empty;
+    use crate::aeroflux::ReadRequest;
+    use crate::aeroflux::ReadResponse;
+    use crate::aeroflux::Record;
+    use crate::aeroflux::WriteRequest;
+    use crate::Error;
+    use crate::StoreService;
+
+    #[test]
+    fn hello() {
+        let result = 2 + 2;
+        assert_eq!(result, 4);
+        assert_ne!("😇", "👿");
+    }
+
+    struct TestDir {
+        path: String,
+    }
+    impl TestDir {
+        fn new() -> TestDir {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("current epoch");
+            let path = format!(
+                "/tmp/aeroflux/test/{}.{:06}",
+                now.as_secs(),
+                now.subsec_micros()
+            );
+            //println!("TestDir: {}", path);
+            TestDir { path }
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.path.as_str()).is_ok();
+            //println!("TestDir drop {}", self.path);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_write_read() -> Result<(), Error> {
+        let test_dir = TestDir::new();
+        let store_service = StoreService::new(test_dir.path.clone());
+
+        let _ = store_service
+            .create_segment(crate::SegmentID {
+                topic: "test".to_string(),
+                segment_index: 42,
+            })
+            .await?;
+
+        let write_response = store_service
+            .write(tonic::Request::new(WriteRequest {
+                topic: "test".to_string(),
+                segment_index: 42,
+                records: vec![
+                    Record {
+                        timestamp: None,
+                        value: "hello".into(),
+                    },
+                    Record {
+                        timestamp: None,
+                        value: "goodbye".into(),
+                    },
+                ],
+            }))
+            .await?;
+        assert_eq!(2, write_response.get_ref().next_offset);
+
+        // Read from offset 0
+        let req = ReadRequest {
+            topic: "test".to_string(),
+            segment_index: 42,
+            from_offset: 0,
+        };
+        let mut responses: Vec<ReadResponse> = vec![];
+        let mut read_rx = store_service.read(Request::new(req)).await?.into_inner();
+        while let Some(read_result) = read_rx.as_mut().recv().await {
+            let read_response = read_result?;
+            responses.push(read_response);
+        }
+        assert_eq!(
+            vec![
+                ReadResponse {
+                    event: Some(Event::Record(Record {
+                        timestamp: None,
+                        value: "hello".into(),
+                    }))
+                },
+                ReadResponse {
+                    event: Some(Event::Record(Record {
+                        timestamp: None,
+                        value: "goodbye".into(),
+                    }))
+                },
+                ReadResponse {
+                    event: Some(Event::End(Empty {}))
+                }
+            ],
+            responses
+        );
+
+        // Read from offset 1
+        let req = ReadRequest {
+            topic: "test".to_string(),
+            segment_index: 42,
+            from_offset: 1,
+        };
+        let mut responses: Vec<ReadResponse> = vec![];
+        let mut read_rx = store_service.read(Request::new(req)).await?.into_inner();
+        while let Some(read_result) = read_rx.as_mut().recv().await {
+            let read_response = read_result?;
+            responses.push(read_response);
+        }
+        assert_eq!(
+            vec![
+                ReadResponse {
+                    event: Some(Event::Record(Record {
+                        timestamp: None,
+                        value: "goodbye".into(),
+                    }))
+                },
+                ReadResponse {
+                    event: Some(Event::End(Empty {}))
+                }
+            ],
+            responses
+        );
+
+        Ok(())
     }
 }
