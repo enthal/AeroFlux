@@ -563,6 +563,16 @@ mod tests {
             .await?;
         assert_eq!(2, write_response.get_ref().next_offset);
 
+        let new_read_response_record = |s: &str| ReadResponse {
+            event: Some(Event::Record(Record {
+                timestamp: None,
+                value: s.into(),
+            })),
+        };
+        let new_read_response_end = || ReadResponse {
+            event: Some(Event::End(Empty {})),
+        };
+
         // Read from offset 0
         let mut read_rx = store_service.read(new_read_request(0)).await?.into_inner();
         let mut responses: Vec<ReadResponse> = vec![];
@@ -572,21 +582,9 @@ mod tests {
         }
         assert_eq!(
             vec![
-                ReadResponse {
-                    event: Some(Event::Record(Record {
-                        timestamp: None,
-                        value: "hello".into(),
-                    }))
-                },
-                ReadResponse {
-                    event: Some(Event::Record(Record {
-                        timestamp: None,
-                        value: "goodbye".into(),
-                    }))
-                },
-                ReadResponse {
-                    event: Some(Event::End(Empty {}))
-                }
+                new_read_response_record("hello"),
+                new_read_response_record("goodbye"),
+                new_read_response_end(),
             ],
             responses
         );
@@ -600,21 +598,16 @@ mod tests {
         }
         assert_eq!(
             vec![
-                ReadResponse {
-                    event: Some(Event::Record(Record {
-                        timestamp: None,
-                        value: "goodbye".into(),
-                    }))
-                },
-                ReadResponse {
-                    event: Some(Event::End(Empty {}))
-                }
+                //
+                new_read_response_record("goodbye"),
+                new_read_response_end(),
             ],
             responses
         );
 
         // TODO: test error on read from invalid offset
         // TODO: test write/read more records to same segment
+        // TODO: test new StoreService.on_startup
 
         Ok(())
     }
