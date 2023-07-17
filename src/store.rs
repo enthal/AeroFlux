@@ -520,14 +520,6 @@ mod tests {
         let test_dir = TestDir::new();
         let store_service = StoreService::new(test_dir.path.clone());
 
-        let new_read_request = |from_offset: u32| {
-            Request::new(ReadRequest {
-                topic: "test".to_string(),
-                segment_index: 42,
-                from_offset,
-            })
-        };
-
         // Read, before the segment exists
         match store_service.read(new_read_request(0)).await {
             Err(e) => assert_eq!(tonic::Code::NotFound, e.code()),
@@ -563,52 +555,80 @@ mod tests {
             .await?;
         assert_eq!(2, write_response.get_ref().next_offset);
 
-        let new_read_response_record = |s: &str| ReadResponse {
-            event: Some(Event::Record(Record {
-                timestamp: None,
-                value: s.into(),
-            })),
-        };
-        let new_read_response_end = || ReadResponse {
-            event: Some(Event::End(Empty {})),
-        };
+        // Read from offset 999: error: OutOfRange
+        match store_service.read(new_read_request(999)).await {
+            Err(e) => assert_eq!(tonic::Code::OutOfRange, e.code()),
+            Ok(x) => panic!("result not an error: {:?}", x),
+        }
 
         // Read from offset 0
-        let mut read_rx = store_service.read(new_read_request(0)).await?.into_inner();
-        let mut responses: Vec<ReadResponse> = vec![];
-        while let Some(read_result) = read_rx.as_mut().recv().await {
-            let read_response = read_result?;
-            responses.push(read_response);
-        }
-        assert_eq!(
+        read_assert_eq(
+            &store_service,
+            0,
             vec![
                 new_read_response_record("hello"),
                 new_read_response_record("goodbye"),
                 new_read_response_end(),
             ],
-            responses
-        );
+        )
+        .await?;
 
         // Read from offset 1
-        let mut read_rx = store_service.read(new_read_request(1)).await?.into_inner();
-        let mut responses: Vec<ReadResponse> = vec![];
-        while let Some(read_result) = read_rx.as_mut().recv().await {
-            let read_response = read_result?;
-            responses.push(read_response);
-        }
-        assert_eq!(
+        read_assert_eq(
+            &store_service,
+            1,
             vec![
                 //
                 new_read_response_record("goodbye"),
                 new_read_response_end(),
             ],
-            responses
-        );
+        )
+        .await?;
 
         // TODO: test error on read from invalid offset
         // TODO: test write/read more records to same segment
         // TODO: test new StoreService.on_startup
 
         Ok(())
+    }
+
+    fn new_read_request(from_offset: u32) -> Request<ReadRequest> {
+        Request::new(ReadRequest {
+            topic: "test".to_string(),
+            segment_index: 42,
+            from_offset,
+        })
+    }
+
+    async fn read_assert_eq(
+        store_service: &StoreService,
+        from_offset: u32,
+        expect: Vec<ReadResponse>,
+    ) -> Result<(), Error> {
+        let mut read_rx = store_service
+            .read(new_read_request(from_offset))
+            .await?
+            .into_inner();
+        let mut responses: Vec<ReadResponse> = vec![];
+        while let Some(read_result) = read_rx.as_mut().recv().await {
+            let read_response = read_result?;
+            responses.push(read_response);
+        }
+        assert_eq!(expect, responses);
+        Ok(())
+    }
+
+    fn new_read_response_record(s: &str) -> ReadResponse {
+        ReadResponse {
+            event: Some(Event::Record(Record {
+                timestamp: None,
+                value: s.into(),
+            })),
+        }
+    }
+    fn new_read_response_end() -> ReadResponse {
+        ReadResponse {
+            event: Some(Event::End(Empty {})),
+        }
     }
 }
