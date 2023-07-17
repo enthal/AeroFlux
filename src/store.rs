@@ -521,6 +521,22 @@ mod tests {
         let test_dir = TestDir::new();
         let store_service = StoreService::new(test_dir.path.clone());
 
+        let new_read_request = |from_offset: u32| ReadRequest {
+            topic: "test".to_string(),
+            segment_index: 42,
+            from_offset,
+        };
+
+        // Read, before the segment exists
+        let req = new_read_request(0);
+        let result = store_service.read(Request::new(req)).await;
+        if let Err(e) = result {
+            assert_eq!(tonic::Code::NotFound, e.code());
+        } else {
+            panic!("result not an error");
+        };
+
+        // Create the segment
         let _ = store_service
             .create_segment(crate::SegmentID {
                 topic: "test".to_string(),
@@ -528,6 +544,9 @@ mod tests {
             })
             .await?;
 
+        // TODO: test no records in response to read from empty segment
+
+        // Write 2 records to segment
         let write_response = store_service
             .write(tonic::Request::new(WriteRequest {
                 topic: "test".to_string(),
@@ -547,11 +566,7 @@ mod tests {
         assert_eq!(2, write_response.get_ref().next_offset);
 
         // Read from offset 0
-        let req = ReadRequest {
-            topic: "test".to_string(),
-            segment_index: 42,
-            from_offset: 0,
-        };
+        let req = new_read_request(0);
         let mut responses: Vec<ReadResponse> = vec![];
         let mut read_rx = store_service.read(Request::new(req)).await?.into_inner();
         while let Some(read_result) = read_rx.as_mut().recv().await {
@@ -580,11 +595,7 @@ mod tests {
         );
 
         // Read from offset 1
-        let req = ReadRequest {
-            topic: "test".to_string(),
-            segment_index: 42,
-            from_offset: 1,
-        };
+        let req = new_read_request(1);
         let mut responses: Vec<ReadResponse> = vec![];
         let mut read_rx = store_service.read(Request::new(req)).await?.into_inner();
         while let Some(read_result) = read_rx.as_mut().recv().await {
@@ -605,6 +616,9 @@ mod tests {
             ],
             responses
         );
+
+        // TODO: test error on read from invalid offset
+        // TODO: test write/read more records to same segment
 
         Ok(())
     }
