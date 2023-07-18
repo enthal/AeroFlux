@@ -15,10 +15,14 @@ message CreateSegmentRequest {
 message WriteRequest {
     string topic = 1;
     uint64 segment_index = 2;
-    repeated Record records = 3;
+    repeated WriteRecord records = 3;
 }
 
-message Record {
+message WriteRecord {
+    bytes value = 2;
+}
+
+message StoreRecord {
     Timestamp timestamp = 1;
     bytes value = 2;
 }
@@ -36,7 +40,7 @@ message ReadRequest {
 
 message ReadResponse {
     oneof event {
-        Record record = 1;
+        StoreRecord record = 1;
         Empty end = 2;
         Empty close = 3;
         ErrorCode error = 4;

@@ -30,8 +30,8 @@ pub mod aeroflux {
 use aeroflux::{
     read_response::Event,
     store_server::{Store, StoreServer},
-    CreateSegmentRequest, Empty, ErrorCode, ReadRequest, ReadResponse, Record, Timestamp,
-    WriteRequest, WriteResponse, FILE_DESCRIPTOR_SET,
+    CreateSegmentRequest, Empty, ErrorCode, ReadRequest, ReadResponse, StoreRecord, Timestamp,
+    WriteRecord, WriteRequest, WriteResponse, FILE_DESCRIPTOR_SET,
 };
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -45,7 +45,11 @@ async fn main() -> Result<(), Error> {
         .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
         .build()?;
 
-    let store_service = StoreService::new(".data".to_string());
+    let store_service = StoreService::new(
+        //
+        ".data".to_string(),
+        Arc::new(SystemClock {}),
+    );
     store_service.on_startup().await?;
 
     let addr = "[::1]:11000".parse().unwrap();
@@ -75,7 +79,7 @@ pub struct SegmentSink {
 type SegementsById = Arc<Mutex<HashMap<SegmentID, SegmentSink>>>;
 
 enum WriteEvent {
-    Record(Record),
+    Record(WriteRecord),
     Sync(SyncEvent),
 }
 
@@ -87,12 +91,14 @@ struct SyncEvent {
 pub struct StoreService {
     root_path: String,
     segements_by_id: SegementsById,
+    clock: Arc<dyn Clock>,
 }
 impl StoreService {
-    fn new(root_path: String) -> StoreService {
+    fn new(root_path: String, clock: Arc<dyn Clock>) -> StoreService {
         StoreService {
             root_path,
             segements_by_id: Arc::new(Mutex::new(HashMap::new())),
+            clock,
         }
     }
 }
@@ -161,6 +167,7 @@ impl StoreService {
             topic: segment_id.topic,
             segment_index: segment_id.segment_index,
         };
+        let clock = self.clock.clone();
         tokio::spawn(
             async move {
                 // TODO: Handle returned errors somehow.
@@ -206,9 +213,14 @@ impl StoreService {
                         WriteEvent::Record(record) => {
                             info!("Write record to pos [{}]", records_next_pos);
                             records_buf.clear();
-                            record
-                                .encode_length_delimited(&mut records_buf)
-                                .expect("protobuf encoding should succeed");
+
+                            StoreRecord {
+                                timestamp: Some(clock.now()),
+                                value: record.value,
+                            }
+                            .encode_length_delimited(&mut records_buf)
+                            .expect("protobuf encoding should succeed");
+
                             if (records_next_pos as u64) + (records_buf.len() as u64)
                                 > (u32::MAX as u64)
                             {
@@ -225,12 +237,13 @@ impl StoreService {
                             records_next_pos += records_buf.len() as u32;
                             next_offset += 1;
                         }
+
                         WriteEvent::Sync(sync_event) => {
                             records_file.sync_all().await?;
                             index_file.sync_all().await?;
 
                             let response = WriteResponse {
-                                timestamp: Some(now()),
+                                timestamp: Some(clock.now()),
                                 next_offset,
                             };
                             info!("{:?}", response);
@@ -416,7 +429,7 @@ impl StoreService {
             let mut record_buf = vec![0u8; record_length];
             records_file.read_exact(&mut record_buf).await?;
             let record_buf = prost::bytes::Bytes::from(record_buf);
-            let record = Record::decode(record_buf)?;
+            let record = StoreRecord::decode(record_buf)?;
             stream_tx
                 .send(Ok(ReadResponse {
                     event: Some(Event::Record(record)),
@@ -431,13 +444,21 @@ impl StoreService {
     }
 }
 
-fn now() -> Timestamp {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("current epoch");
-    Timestamp {
-        seconds: now.as_secs(),
-        nanos: now.subsec_nanos(),
+trait Clock: Send + Sync + core::fmt::Debug {
+    fn now(&self) -> Timestamp;
+}
+
+#[derive(Debug)]
+struct SystemClock {}
+impl Clock for SystemClock {
+    fn now(&self) -> Timestamp {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("current epoch");
+        Timestamp {
+            seconds: now.as_secs(),
+            nanos: now.subsec_nanos(),
+        }
     }
 }
 
@@ -469,6 +490,7 @@ impl Pathing {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
 
@@ -479,8 +501,11 @@ mod tests {
     use crate::aeroflux::Empty;
     use crate::aeroflux::ReadRequest;
     use crate::aeroflux::ReadResponse;
-    use crate::aeroflux::Record;
+    use crate::aeroflux::StoreRecord;
+    use crate::aeroflux::Timestamp;
+    use crate::aeroflux::WriteRecord;
     use crate::aeroflux::WriteRequest;
+    use crate::Clock;
     use crate::Error;
     use crate::StoreService;
 
@@ -515,10 +540,27 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FixedClock {}
+    impl Clock for FixedClock {
+        fn now(&self) -> Timestamp {
+            FIXED_TIMESTAMP
+        }
+    }
+
+    const FIXED_TIMESTAMP: Timestamp = Timestamp {
+        seconds: 1234,
+        nanos: 5678,
+    };
+
     #[tokio::test]
     async fn create_write_read() -> Result<(), Error> {
         let test_dir = TestDir::new();
-        let store_service = StoreService::new(test_dir.path.clone());
+        let store_service = StoreService::new(
+            //
+            test_dir.path.clone(),
+            Arc::new(FixedClock {}),
+        );
 
         // Read, before the segment exists
         match store_service.read(new_read_request(0)).await {
@@ -542,12 +584,10 @@ mod tests {
                 topic: "test".to_string(),
                 segment_index: 42,
                 records: vec![
-                    Record {
-                        timestamp: None,
+                    WriteRecord {
                         value: "hello".into(),
                     },
-                    Record {
-                        timestamp: None,
+                    WriteRecord {
                         value: "goodbye".into(),
                     },
                 ],
@@ -620,8 +660,8 @@ mod tests {
 
     fn new_read_response_record(s: &str) -> ReadResponse {
         ReadResponse {
-            event: Some(Event::Record(Record {
-                timestamp: None,
+            event: Some(Event::Record(StoreRecord {
+                timestamp: Some(FIXED_TIMESTAMP),
                 value: s.into(),
             })),
         }
