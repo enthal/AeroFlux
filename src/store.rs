@@ -185,6 +185,26 @@ impl StoreService {
                     .open(pathing.index_file_path())
                     .await?;
 
+                // TODO: truncate (set_len) records_file to end of last indexed record (if any):
+                //  end of the record that begins at the pos provided by the last entry in index_file.
+                //  This removes any partially-written record that was cut short because of unclean shutdown.
+                //  This solution only works if index file writes are guaranteed to be available in index file
+                //  before the records_file is written, but I think that may not actually be guaranteed.
+                //  It may therefore for necessary to _then_ iteratively validate backwards, reading and decoding
+                //  the record for the last index entry, and if that fails, truncate away the that index entry and
+                //  the record_file data from the pos of that entry (which may still be beyond record_file EOF),
+                //  continuing backward until a record is successfully read and decoded.
+                //  In this case, data will be lost, but the rest of the segment will be valid, and since a Sync
+                //  operation syncs both files to disk, this valid data must include everything through the
+                //  last successful Sync operation on the segment, assuming the file hasn't been externally
+                //  tampered with or corrupted.
+                //  To be extra sure, we could read from the start of both files instead, but this will
+                //  dramatically slow startup time: we trust that bytes on disk, and thus records and index entries
+                //  are valid-where-complete, and that they may only be incomplete at the end of either file.
+                //  Test this by truncating part of a record.
+                //  Also, this assumes each index entry is complete if any of its bytes are present, but we should
+                //  truncate the index file to len-len%4 (modulo 4, since an index entru is a u32: 4 bytes).
+
                 // Note: pos means byte index in records_file; offset means record offset in segment.
 
                 // records_file must not be longer than u32::MAX, since its length must fit in a 4-byte index file entry.
