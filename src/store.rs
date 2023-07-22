@@ -225,6 +225,7 @@ impl StoreService {
                     return Err(Status::out_of_range("Segment full"));
                 }
                 let mut next_offset = next_offset as u32;
+                // TODO: use SegmentSink.next_offset, and in read, read only up to that value
 
                 // TODO: Bytes/Buf
                 let mut records_buf: Vec<u8> = Vec::new();
@@ -367,6 +368,8 @@ impl Store for StoreService {
             .read(true)
             .open(pathing.index_file_path())
             .await?;
+        // TODO: use SegmentSink.next_offset instead of record_count (from file size), when segment is open,
+        //  and maybe check it again and keep reading after reaching it by reading the first time
         let record_count =
             index_file.seek(SeekFrom::End(0)).await? as u32 / size_of::<u32>() as u32;
         if req.from_offset > record_count {
